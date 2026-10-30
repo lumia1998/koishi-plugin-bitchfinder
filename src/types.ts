@@ -1,6 +1,6 @@
 /** 多引擎反搜的通用候选结构。字段语义与 AstrBot 原版一致。 */
 export interface PostCandidate {
-  /** yandex / saucenao / ascii2d / gcv / baidu / copyseeker / gcl */
+  /** yandex / saucenao / ascii2d / gcv / lens（免 Key Lens） / gcl（SerpApi Lens） */
   engine: string
   /** 出处页面（帖子或镜像页） */
   pageUrl: string

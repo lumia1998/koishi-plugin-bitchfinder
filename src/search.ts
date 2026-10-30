@@ -6,10 +6,9 @@
 import { HttpClient } from './http'
 import {
   searchAscii2d,
-  searchBaidu,
-  searchCopyseeker,
   searchGcv,
   searchGoogleLens,
+  searchGoogleLensFree,
   searchSaucenao,
   searchYandex,
 } from './engines'
@@ -34,11 +33,13 @@ export interface SearchConfig {
   proxy: string
   saucenaoApiKey: string
   gcvApiKey: string
+  /** ascii2d 请求模式：default 不携带 cookie（与 flj_finder 一致），cookie 携带 cf_clearance */
+  ascii2dMode: 'default' | 'cookie'
   ascii2dCookie: string
   serpapiApiKey: string
   serpapiVisualMatches: boolean
-  baiduEnabled: boolean
-  copyseekerEnabled: boolean
+  /** 免 Key Google Lens，直接上传图片解析结果页（不依赖 Yandex 公网图 URL） */
+  keylessGoogleLens: boolean
   useLlmCandidates: boolean
   followerTiebreak: boolean
 }
@@ -152,6 +153,16 @@ export async function reverseSearch(
 
   // 2) 其余引擎并发；单引擎失败不影响其他引擎
   const tasks: Array<{ name: string; promise: Promise<PostCandidate[]> }> = []
+  if (cfg.keylessGoogleLens) {
+    // 免 Key Lens 直接吃图片 Buffer，不依赖 Yandex 是否成功
+    tasks.push({
+      name: 'lens',
+      promise: searchGoogleLensFree(deps.http, image, {
+        timeout: cfg.timeout,
+        proxy: cfg.proxy,
+      }),
+    })
+  }
   if (cfg.saucenaoApiKey && publicImageUrl) {
     tasks.push({
       name: 'saucenao',
@@ -173,16 +184,17 @@ export async function reverseSearch(
       }),
     })
   }
-  if (cfg.ascii2dCookie) {
-    tasks.push({
-      name: 'ascii2d',
-      promise: searchAscii2d(deps.http, image, {
-        timeout: cfg.timeout,
-        proxy: cfg.proxy,
-        cfClearance: cfg.ascii2dCookie,
-      }),
-    })
+  if (cfg.ascii2dMode === 'cookie' && !cfg.ascii2dCookie) {
+    deps.warn('ascii2d 已设为 cookie 模式但未填写 cf_clearance，本次按无 cookie 请求')
   }
+  tasks.push({
+    name: 'ascii2d',
+    promise: searchAscii2d(deps.http, image, {
+      timeout: cfg.timeout,
+      proxy: cfg.proxy,
+      cfClearance: cfg.ascii2dMode === 'cookie' ? cfg.ascii2dCookie : '',
+    }),
+  })
   if (cfg.gcvApiKey) {
     tasks.push({
       name: 'gcv',
@@ -193,31 +205,19 @@ export async function reverseSearch(
       }),
     })
   }
-  if (cfg.baiduEnabled) {
-    tasks.push({
-      name: 'baidu',
-      promise: searchBaidu(deps.http, image, {
-        timeout: cfg.timeout,
-        proxy: cfg.proxy,
-      }),
-    })
-  }
-  if (cfg.copyseekerEnabled) {
-    tasks.push({
-      name: 'copyseeker',
-      promise: searchCopyseeker(deps.http, image, {
-        timeout: cfg.timeout + 20,
-        proxy: cfg.proxy,
-      }),
-    })
-  }
 
   const results = await Promise.allSettled(tasks.map((task) => task.promise))
   results.forEach((result, index) => {
     const name = tasks[index].name
     if (result.status === 'rejected') {
-      engineErrors[name] = String(result.reason)
-      deps.warn(`${name} 失败: ${String(result.reason)}`)
+      const reason = String(result.reason)
+      // 默认模式下 ascii2d 被 CF 拦截属于已知情况，只在日志里提示，不污染结果
+      if (cfg.ascii2dMode === 'default' && name === 'ascii2d') {
+        deps.warn(`${name} 失败: ${reason}`)
+      } else {
+        engineErrors[name] = reason
+        deps.warn(`${name} 失败: ${reason}`)
+      }
     } else {
       deps.log(`${name}: ${result.value.length} 条`)
       candidates.push(...result.value)

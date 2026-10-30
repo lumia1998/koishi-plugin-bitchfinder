@@ -83,7 +83,6 @@ export class HttpClient {
         headers,
         body: options.body,
         signal: controller.signal,
-        redirect: 'follow',
       }
       if (dispatcher) init.dispatcher = dispatcher
       return await fetch(buildUrl(url, options.query), init)

@@ -4,6 +4,7 @@
  * 置信度模型（0-1，封顶）：
  * - 正文署名（Yandex 转发者正文中注明原作者）：+0.35/次
  * - SauceNAO 返回的作者（官方索引）：+0.45，且附原帖
+ * - Google Lens 完全匹配到 X 原帖/主页：+0.30 / +0.20
  * - ascii2d 结果作者：+0.30，且附原帖
  * - 标题/URL handle（可能是转发者）：+0.10/次
  * - 感知哈希同图硬确认（>=0.90）：+0.20；0.75-0.90 可疑：+0.05
@@ -99,6 +100,8 @@ export function fuse(
   phashScores: Record<string, number> = {},
 ): AuthorVerdict[] {
   const authors = new Map<string, AuthorVerdict>()
+  // 免 Key Lens 与 SerpApi Lens 查的是同一个索引，同一结果页只计一次
+  const lensSeen = new Set<string>()
 
   const author = (handle: string, platform: string): AuthorVerdict => {
     const key = `${handle.toLowerCase()}|${platform}`
@@ -225,6 +228,40 @@ export function fuse(
         const a = author(h, 'X/Twitter')
         a.confidence = Math.min(1, a.confidence + 0.15)
         a.evidence.push(`Google Vision 匹配页: ${c.pageUrl.slice(0, 70)}`)
+      }
+    } else if (c.engine === 'lens' || c.engine === 'gcl') {
+      const key = (c.pageUrl || '').replace(/\/+$/, '').toLowerCase()
+      if (!key || lensSeen.has(key)) continue
+      lensSeen.add(key)
+
+      const label = c.engine === 'lens' ? 'Google Lens' : 'SerpApi Lens'
+      const root = domainRoot(c.pageUrl)
+
+      if (statusMatch) {
+        // exact_matches 直接命中 X 原帖：这是最可靠的开箱即用证据
+        const a = author(statusMatch[1], 'X/Twitter')
+        a.confidence = Math.min(1, a.confidence + 0.30)
+        a.domains.add(root)
+        if (!a.postUrl) a.postUrl = statusMatch[0]
+        if (!a.pageUrl) a.pageUrl = c.pageUrl
+        a.evidence.push(`${label} 完全匹配原帖: ${c.pageUrl.slice(0, 70)}`)
+      } else {
+        const profileMatch = c.pageUrl.match(
+          /(?:x\.com|twitter\.com)\/@?([A-Za-z0-9_]{2,20})\/?(?:[?#]|$)/,
+        )
+        const titleMatch = (c.title || '').match(TITLE_HANDLE_RE)
+        const h = profileMatch
+          ? cleanHandle(profileMatch[1])
+          : titleMatch
+            ? cleanHandle(titleMatch[1])
+            : ''
+        if (h) {
+          const a = author(h, 'X/Twitter')
+          a.confidence = Math.min(1, a.confidence + (profileMatch ? 0.20 : 0.10))
+          a.domains.add(root)
+          if (!a.pageUrl) a.pageUrl = c.pageUrl
+          a.evidence.push(`${label} 匹配页: ${c.pageUrl.slice(0, 70)}`)
+        }
       }
     }
   }

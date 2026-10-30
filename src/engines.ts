@@ -5,6 +5,8 @@
  * （网络、风控、缺 key）都只影响自身，不影响其他引擎。
  */
 
+import { DomUtils, parseDocument } from 'htmlparser2'
+
 import { HttpClient } from './http'
 import { EngineError, PostCandidate } from './types'
 
@@ -328,112 +330,6 @@ export async function searchGcv(
 }
 
 // ---------------------------------------------------------------------------
-// Baidu 识图：graph.baidu.com 上传 → pcsimi 相同/相似结果（线索级）
-// ---------------------------------------------------------------------------
-
-export async function searchBaidu(
-  http: HttpClient,
-  image: Buffer,
-  options: { timeout?: number; proxy?: string },
-): Promise<PostCandidate[]> {
-  const data: any = await http.postFileJson('https://graph.baidu.com/upload', 'image', image, {
-    timeout: options.timeout,
-    proxy: options.proxy,
-    filename: 'blob',
-    contentType: 'image/jpeg',
-    query: { uptime: Date.now(), tn: 'pc', from: 'pc' },
-  })
-  if (Number(data?.status) !== 0) {
-    throw new EngineError(`Baidu upload status=${data?.status}`)
-  }
-  const pageUrl: string = data?.result?.url || ''
-  if (!pageUrl) throw new EngineError('Baidu upload 未返回结果页 URL')
-
-  const ajaxUrl = pageUrl.replace('/similar', '/ajax/pcsimi')
-  const res = await http.getJson(ajaxUrl, {
-    timeout: options.timeout,
-    proxy: options.proxy,
-    query: { tn: 'pc' },
-  })
-
-  const out: PostCandidate[] = []
-  const seen = new Set<string>()
-  for (const card of res?.card || []) {
-    for (const item of card?.same || []) {
-      const url = item?.url || ''
-      if (url && !seen.has(url)) {
-        seen.add(url)
-        out.push({
-          engine: 'baidu',
-          pageUrl: url,
-          title: item?.title || item?.titleStr || '',
-          imageUrl: item?.thumbUrl || '',
-          weight: 0.2,
-        })
-      }
-    }
-  }
-  if (!out.length) throw new EngineError('Baidu 未解析到结果（结构可能已变更）')
-  return out
-}
-
-// ---------------------------------------------------------------------------
-// Copyseeker：按图检索收录页面，常直接给出 X 帖子（线索级）
-// ---------------------------------------------------------------------------
-
-export async function searchCopyseeker(
-  http: HttpClient,
-  image: Buffer,
-  options: { timeout?: number; proxy?: string },
-): Promise<PostCandidate[]> {
-  const data: any = await http.postFileJson(
-    'https://copyseeker.net/api/discovery',
-    'image',
-    image,
-    {
-      timeout: options.timeout,
-      proxy: options.proxy,
-      filename: 'blob',
-      contentType: 'image/jpeg',
-    },
-  )
-  const token = data?.token || data?.id
-  if (!token) throw new EngineError('Copyseeker 未返回 discovery token')
-
-  let results: any[] = []
-  for (let attempt = 0; attempt < 6; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 3000))
-    try {
-      const rdata: any = await http.getJson(
-        `https://copyseeker.net/api/discovery/${token}/results`,
-        { timeout: options.timeout, proxy: options.proxy },
-      )
-      results = rdata?.results || []
-      if (results.length) break
-    } catch {
-      // 单次轮询失败不致命
-    }
-  }
-  if (!results.length) throw new EngineError('Copyseeker 超时未取得结果')
-
-  const out: PostCandidate[] = []
-  const seen = new Set<string>()
-  for (const item of results) {
-    const url = item?.url || ''
-    if (!url || seen.has(url)) continue
-    seen.add(url)
-    out.push({
-      engine: 'copyseeker',
-      pageUrl: url,
-      title: item?.title || '',
-      imageUrl: item?.imageUrl || item?.thumbUrl || '',
-      weight: 0.2,
-    })
-  }
-  return out
-}
-
-// ---------------------------------------------------------------------------
 // SerpApi Google Lens：exact_matches 完全匹配（官方第三方 API，付费）
 // ---------------------------------------------------------------------------
 
@@ -485,4 +381,177 @@ export async function searchGoogleLens(
     }
   }
   return out
+}
+
+// ---------------------------------------------------------------------------
+// 免 Key Google Lens：直接上传图片并解析结果页
+//
+// 流程与 flj_finder 使用的 PicImageSearch 完全一致：
+//   POST lens.google.com/v3/upload (multipart encoded_image)
+//   → 上传响应里找 exact_matches 标签（udm=48）→ GET 该结果页
+//   → 解析 .YxbOwd 条目（a.ngTNl / .ZhosBf / .xuPcX）
+// Google 在部分出口 IP 上会返回“需要启用 JavaScript”的验证页，这时明确报错，
+// 不把它当成“没有结果”。
+// ---------------------------------------------------------------------------
+
+const LENS_HEADERS = { 'Accept-Language': 'en-US,en;q=0.9' }
+
+function lensHasClass(el: any, name: string): boolean {
+  const cls = DomUtils.getAttributeValue(el, 'class') || ''
+  return cls.split(/\s+/).includes(name)
+}
+
+function lensFind(nodes: any[], test: (el: any) => boolean): any {
+  return DomUtils.findOne(test, nodes, true)
+}
+
+function lensText(el: any): string {
+  if (!el) return ''
+  return String(DomUtils.textContent(el) || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** 从内联脚本里提取 google.ldi 图片映射（Google 用 data-iid 引用）。 */
+function extractLensImageMap(html: string): Map<string, string> {
+  const map = new Map<string, string>()
+  const m = html.match(/google\.ldi\s*=\s*(\{[^}]+\})/)
+  if (!m) return map
+  try {
+    const obj = JSON.parse(
+      m[1].replace(/\\u003d/g, '=').replace(/\\u0026/g, '&'),
+    )
+    for (const [key, value] of Object.entries(obj)) {
+      if (typeof value === 'string') map.set(key, value)
+    }
+  } catch {
+    // 脚本不是严格 JSON 时放弃图片映射，不影响页面/标题解析
+  }
+  return map
+}
+
+function lensImageUrl(img: any, map: Map<string, string>): string {
+  const iid =
+    DomUtils.getAttributeValue(img, 'data-iid') ||
+    DomUtils.getAttributeValue(img, 'id') ||
+    ''
+  const mapped = iid ? map.get(iid) : ''
+  if (mapped) return mapped
+  const raw =
+    DomUtils.getAttributeValue(img, 'data-src') ||
+    DomUtils.getAttributeValue(img, 'src') ||
+    ''
+  return /^https?:\/\//i.test(raw) ? raw : ''
+}
+
+/** 把 Google 的跳转链接还原成目标页；站内链接直接丢弃。 */
+function unwrapLensUrl(href: string): string {
+  if (!href) return ''
+  if (href.startsWith('/url?')) {
+    try {
+      const q = new URL(href, 'https://www.google.com').searchParams.get('q')
+      if (q && /^https?:\/\//i.test(q)) return q
+    } catch {
+      return ''
+    }
+  }
+  return /^https?:\/\//i.test(href) ? href : ''
+}
+
+/** 找到 exact_matches 标签的链接（udm=48）。 */
+export function findLensExactHref(html: string): string {
+  const doc = parseDocument(html)
+  const anchor = lensFind(doc.children as any[], (el: any) => {
+    if (el?.name !== 'a') return false
+    const href = DomUtils.getAttributeValue(el, 'href') || ''
+    return /[?&]udm(?:%3D|=)48(?:&|$)/i.test(href)
+  })
+  return anchor ? DomUtils.getAttributeValue(anchor, 'href') || '' : ''
+}
+
+function isLensBlockedPage(html: string): boolean {
+  if (!html) return true
+  if (/httpservice\/retry\/enablejs|enablejs\?sei=/i.test(html)) return true
+  if (/consent\.google\.com|Before you continue to Google/i.test(html)) return true
+  if (
+    !html.includes('YxbOwd') &&
+    /captcha|unusual traffic|sorry\/index/i.test(html)
+  ) {
+    return true
+  }
+  return false
+}
+
+export function parseLensExactHtml(html: string): PostCandidate[] {
+  if (isLensBlockedPage(html)) {
+    throw new EngineError(
+      'Google Lens 返回验证页/需要 JavaScript（搜索未交付，非无结果）',
+    )
+  }
+
+  const doc = parseDocument(html)
+  const items = DomUtils.findAll(
+    (el: any) => lensHasClass(el, 'YxbOwd'),
+    doc.children as any[],
+  )
+  const imageMap = extractLensImageMap(html)
+  const out: PostCandidate[] = []
+  const seen = new Set<string>()
+
+  for (const item of items) {
+    const anchor = lensFind([item], (el: any) => el?.name === 'a' && lensHasClass(el, 'ngTNl'))
+    const pageUrl = unwrapLensUrl(
+      anchor ? DomUtils.getAttributeValue(anchor, 'href') || '' : '',
+    )
+    if (!pageUrl || seen.has(pageUrl)) continue
+    seen.add(pageUrl)
+
+    const titleEl = lensFind([item], (el: any) => lensHasClass(el, 'ZhosBf'))
+    const siteEl = lensFind([item], (el: any) => lensHasClass(el, 'xuPcX'))
+    const img = lensFind([item], (el: any) => el?.name === 'img')
+
+    out.push({
+      engine: 'lens',
+      pageUrl,
+      title: lensText(titleEl),
+      description: lensText(siteEl),
+      imageUrl: img ? lensImageUrl(img, imageMap) : '',
+      weight: 0.45,
+    })
+  }
+  return out
+}
+
+export async function searchGoogleLensFree(
+  http: HttpClient,
+  image: Buffer,
+  options: { timeout?: number; proxy?: string } = {},
+): Promise<PostCandidate[]> {
+  const upload = await http.postFile(
+    'https://lens.google.com/v3/upload',
+    'encoded_image',
+    image,
+    {
+      timeout: options.timeout,
+      proxy: options.proxy,
+      filename: 'image.jpg',
+      contentType: 'image/jpeg',
+      headers: LENS_HEADERS,
+    },
+  )
+  if (!upload.ok) throw new EngineError(`Google Lens 上传 HTTP ${upload.status}`)
+
+  let html = await upload.text()
+
+  // exact_matches 是单独一个标签页，需要再从上传结果页跳到 udm=48
+  const exactHref = findLensExactHref(html)
+  if (exactHref) {
+    html = await http.getText(new URL(exactHref, 'https://www.google.com').toString(), {
+      timeout: options.timeout,
+      proxy: options.proxy,
+      headers: LENS_HEADERS,
+    })
+  }
+
+  return parseLensExactHtml(html)
 }

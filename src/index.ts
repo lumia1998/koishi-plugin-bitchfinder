@@ -34,11 +34,11 @@ export interface Config {
   proxy: string
   saucenaoApiKey: string
   gcvApiKey: string
+  ascii2dMode: 'default' | 'cookie'
   ascii2dCookie: string
   serpapiApiKey: string
   serpapiVisualMatches: boolean
-  baiduEnabled: boolean
-  copyseekerEnabled: boolean
+  keylessGoogleLens: boolean
   useLlmCandidates: boolean
   model: string
   followerTiebreak: boolean
@@ -77,21 +77,24 @@ export const Config: Schema<Config> = Schema.intersect([
       .role('secret')
       .default('')
       .description('SerpApi API Key，用于 Google Lens exact_matches（付费）。'),
+    ascii2dMode: Schema.union([
+      Schema.const('default').description('默认：不携带 Cookie（与 flj_finder 一致）'),
+      Schema.const('cookie').description('Cookie 模式：携带下方 cf_clearance'),
+    ])
+      .default('default')
+      .description('ascii2d 请求模式。默认按无 Cookie 方式请求，被 Cloudflare 拦截时可切换到 Cookie 模式。'),
     ascii2dCookie: Schema.string()
       .role('secret')
       .default('')
-      .description('ascii2d 的 Cloudflare `cf_clearance` cookie；不填则 ascii2d 大概率被拦截。'),
+      .description('ascii2d 的 Cloudflare `cf_clearance` cookie，仅在 Cookie 模式下使用。'),
   }).description('搜索引擎凭据'),
   Schema.object({
+    keylessGoogleLens: Schema.boolean()
+      .default(true)
+      .description('启用免 Key Google Lens（直接上传图片解析结果页，开箱即用；部分出口 IP 会收到验证页）。'),
     serpapiVisualMatches: Schema.boolean()
       .default(false)
       .description('Google Lens 同时查询 visual_matches（相似图，线索噪声较多）。'),
-    baiduEnabled: Schema.boolean()
-      .default(false)
-      .description('启用百度识图（线索级，中文/国内图源可能有帮助）。'),
-    copyseekerEnabled: Schema.boolean()
-      .default(false)
-      .description('启用 Copyseeker（线索级，轮询较慢，约需 3-18 秒）。'),
   }).description('额外引擎'),
   Schema.object({
     followerTiebreak: Schema.boolean()
@@ -112,11 +115,11 @@ function createSearchConfig(config: Config): SearchConfig {
     proxy: config.proxy,
     saucenaoApiKey: config.saucenaoApiKey,
     gcvApiKey: config.gcvApiKey,
+    ascii2dMode: config.ascii2dMode,
     ascii2dCookie: config.ascii2dCookie,
     serpapiApiKey: config.serpapiApiKey,
     serpapiVisualMatches: config.serpapiVisualMatches,
-    baiduEnabled: config.baiduEnabled,
-    copyseekerEnabled: config.copyseekerEnabled,
+    keylessGoogleLens: config.keylessGoogleLens,
     useLlmCandidates: config.useLlmCandidates,
     followerTiebreak: config.followerTiebreak,
   }
@@ -246,7 +249,7 @@ export function apply(ctx: Context, config: Config) {
     .alias('kfc')
     .usage(
       '附带一张图片发送「找鸡」，或回复一张图片后发送「找鸡」。\n' +
-        '会用 Yandex / SauceNAO / ascii2d / Google 等引擎检索，并按证据强度给出作者候选。',
+        '会用 Yandex / Google Lens / ascii2d / SauceNAO 等引擎检索，并按证据强度给出作者候选。',
     )
     .example('找鸡（附图）')
     .action(async ({ session }) => {
@@ -264,9 +267,34 @@ export function apply(ctx: Context, config: Config) {
         return `反查失败：${err instanceof Error ? err.message : String(err)}`
       }
       if (config.sendAsForward) {
+        // 合并转发用 figure + message 节点表示（与 koishi-plugin-checkgal 的写法一致，
+        // 比旧式 message(forward: true) 更通用）。
+        // 注意不能用 h('text', text)：那会生成 attrs 为空的外层元素，OneBot 适配器
+        // 读到 attrs.content === undefined，flush() 里 trimStart 直接崩溃。
+        const forward = h('figure', {
+          children: [
+            h(
+              'message',
+              {
+                userId: session.userId,
+                nickname:
+                  (session as any).author?.nickname || session.username,
+              },
+              [h.text(text)],
+            ),
+          ],
+        })
         try {
-          await session.send(h('message', { forward: true }, [h('text', text)]))
-          return
+          // 直接走 bot.sendMessage：session.send() 会吞掉适配器异常、只记一条
+          // `[W] session` 日志并返回空数组，外层的 try/catch 永远收不到失败。
+          const messages = await session.bot.sendMessage(
+            session.channelId!,
+            h.normalize(forward),
+            session.event?.referrer,
+            { session },
+          )
+          if (messages?.length) return
+          logger.warn('合并转发未产生消息，回退为普通消息')
         } catch (err) {
           logger.warn('合并转发发送失败，回退为普通消息: %s', err)
         }
