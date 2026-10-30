@@ -1,0 +1,79 @@
+{
+  "name": "koishi-plugin-bitchfinder",
+  "description": "反向图片搜索：发送图片，多引擎查找出处与作者账号（含 X 原帖、Coser 主页署名）",
+  "version": "1.0.0",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "sample.png",
+    "evidence.png"
+  ],
+  "license": "AGPL-3.0",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "author": "lumia1998 (Koishi port) / vmoranv (original AstrBot plugin)",
+  "contributors": [
+    "vmoranv <https://github.com/vmoranv>"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lumia1998/koishi-plugin-bitchfinder.git"
+  },
+  "homepage": "https://github.com/lumia1998/koishi-plugin-bitchfinder#readme",
+  "bugs": {
+    "url": "https://github.com/lumia1998/koishi-plugin-bitchfinder/issues"
+  },
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin",
+    "image",
+    "reverse-image-search",
+    "saucenao",
+    "yandex",
+    "chatluna",
+    "tool"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc -w",
+    "clean": "rimraf lib",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.62",
+    "sharp": "^0.34.2",
+    "undici": "^6.21.0",
+    "zod": "^3.25.76"
+  },
+  "peerDependencies": {
+    "koishi": "^4.18.9",
+    "koishi-plugin-chatluna": "^1.4.0"
+  },
+  "peerDependenciesMeta": {
+    "koishi-plugin-chatluna": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "koishi": "^4.18.9",
+    "koishi-plugin-chatluna": "^1.4.4",
+    "rimraf": "^5.0.5",
+    "typescript": "^5.9.3"
+  },
+  "koishi": {
+    "description": {
+      "zh": "反向图片搜索：发送图片，多引擎查找图片出处与作者账号（含 X 原帖、Coser 主页署名）。可选注册 ChatLuna 工具 findbitch。"
+    },
+    "service": {
+      "required": [],
+      "optional": [
+        "chatluna"
+      ],
+      "implements": []
+    }
+  }
+}
