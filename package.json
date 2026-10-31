@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-bitchfinder",
   "description": "反向图片搜索：发送图片，多引擎查找出处与作者账号（含 X 原帖、Coser 主页署名）",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [

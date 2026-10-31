@@ -7,6 +7,54 @@
 
 import { HttpClient } from './http'
 
+export interface XProfile {
+  /** 账号实际大小写（以资料页为准） */
+  handle: string
+  /** 显示昵称，例如 Naimi奶咪 */
+  name: string
+  followers: number | null
+  description: string
+}
+
+/**
+ * 通过 fxTwitter 公开接口读取 X 账号资料页（无需任何 key）。
+ * 用途：确认 handle 真实存在，并用昵称核对出处页标题里的名字。
+ */
+export async function fetchProfiles(
+  http: HttpClient,
+  handles: string[],
+  options: { timeout?: number; proxy?: string } = {},
+): Promise<Map<string, XProfile>> {
+  const out = new Map<string, XProfile>()
+  const unique = [...new Set(handles.map((h) => h.toLowerCase()))].slice(0, 6)
+  await Promise.all(
+    unique.map(async (handle) => {
+      try {
+        const data: any = await http.getJson(
+          `https://api.fxtwitter.com/${encodeURIComponent(handle)}`,
+          { timeout: options.timeout ?? 10, proxy: options.proxy },
+        )
+        if (data?.code !== undefined && Number(data.code) !== 200) return
+        const user = data?.user || data
+        const screen = String(user?.screen_name || '')
+        if (!screen) return
+        out.set(handle, {
+          handle: screen,
+          name: String(user?.name || ''),
+          followers:
+            typeof user?.followers === 'number' && Number.isFinite(user.followers)
+              ? user.followers
+              : null,
+          description: String(user?.description || ''),
+        })
+      } catch {
+        // 资料页不可达时保持原候选，不做降级或猜测
+      }
+    }),
+  )
+  return out
+}
+
 export async function fetchFollowers(
   http: HttpClient,
   handles: string[],

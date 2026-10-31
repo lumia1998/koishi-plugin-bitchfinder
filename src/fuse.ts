@@ -18,6 +18,8 @@ export const X_URL_RE =
 export const DESC_CREDIT_RE =
   /(?:sc|credit|cr|source|via|cn|photo|drawn\s+by|tw)\s*[:：]\s*@?([A-Za-z0-9_]{2,20})|([A-Za-z0-9_]{2,20})['’]s\s+(?:tweet\s+)?(?:photo|video|status|post)/g
 const DESC_MENTION_RE = /@([A-Za-z0-9_]{2,20})/g
+// matchAll 要求全局正则；TITLE_HANDLE_RE 保持非全局以兼容 String#match
+const TITLE_HANDLE_GLOBAL_RE = new RegExp(TITLE_HANDLE_RE.source, 'g')
 const STATUS_RE = /(?:x\.com|twitter\.com)\/(\w{2,20})\/status\/(\d+)/
 
 const STOPWORDS = new Set([
@@ -36,8 +38,11 @@ const STOPWORDS = new Set([
 ])
 
 const HANDLE_LIKE_RE = /^[A-Za-z0-9_]{4,20}$/
-const HANDLE_PREFIX_RE = /^[A-Za-z0-9_]{4,20}/
 const LETTER_RE = /[A-Za-z]/
+
+// 标题里的独立 handle/人名形态词（聚合站标题通常以人名开头或跟分隔符）
+const AGG_TOKEN_RE =
+  /(?:^|[\s\-–—|:：,，。.、()（）[\]【】])([A-Za-z][A-Za-z0-9_]{3,19})(?=[\s\-–—|:：,，。.、()（）[\]【】]|$)/g
 
 const TITLE_NOISE = new Set([
   'nude', 'leaks', 'leaked', 'onlyfans', 'patreon', 'photo', 'photos',
@@ -70,7 +75,7 @@ export function isHandleLike(token: string): boolean {
   return true
 }
 
-function domainRoot(url: string): string {
+export function domainRoot(url: string): string {
   if (!url.includes('://')) return ''
   let host = url.split('/')[2] || ''
   host = host.split(':')[0]
@@ -85,6 +90,43 @@ export function cleanHandle(handle: string | null | undefined): string {
   return handle.replace(/^@+/, '').trim()
 }
 
+/**
+ * 归一化来源文字：Yandex 会把中文逐字拆开（"奶 咪"），
+ * 这里去掉 CJK 字符之间的空格并统一大小写。
+ */
+export function normalizeText(value: string | null | undefined): string {
+  return (value || '')
+    .normalize('NFKC')
+    .replace(/([　-鿿豈-﫿])\s+(?=[　-鿿豈-﫿])/g, '$1')
+    .toLowerCase()
+}
+
+/** 文本里是否出现该账号名（带不带 @ 均可，边界按 ASCII 词字符判断）。 */
+export function textMentions(text: string | null | undefined, handle: string): boolean {
+  const h = handle.toLowerCase().trim()
+  if (!h) return false
+  const escaped = h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(?<![a-z0-9_])@?${escaped}(?![a-z0-9_])`).test(normalizeText(text))
+}
+
+/**
+ * 统计 X 资料页昵称在多少个独立站点文字中出现。
+ * 用于确认"页面标题里的名字"与该账号是同一个人，而不是同名账号。
+ */
+export function nameMatchDomains(
+  candidates: PostCandidate[],
+  name: string,
+): Set<string> {
+  const domains = new Set<string>()
+  const bare = (name || '').normalize('NFKC').toLowerCase().replace(/\s+/g, '')
+  if (bare.length < 4 || !LETTER_RE.test(bare)) return domains
+  for (const c of candidates) {
+    const text = normalizeText(`${c.title || ''} ${c.description || ''}`).replace(/\s+/g, '')
+    if (text.includes(bare)) domains.add(domainRoot(c.pageUrl))
+  }
+  return domains
+}
+
 export interface AuthorVerdict {
   handle: string
   platform: string
@@ -93,6 +135,12 @@ export interface AuthorVerdict {
   pageUrl: string
   evidence: string[]
   domains: Set<string>
+  /** X 资料页昵称（经 fxTwitter 核实） */
+  profileName?: string
+  /** X 粉丝数（经 fxTwitter 核实） */
+  followers?: number | null
+  /** 是否已通过资料页确认该 handle 是一个真实 X 账号 */
+  profileVerified?: boolean
 }
 
 export function fuse(
@@ -102,6 +150,46 @@ export function fuse(
   const authors = new Map<string, AuthorVerdict>()
   // 免 Key Lens 与 SerpApi Lens 查的是同一个索引，同一结果页只计一次
   const lensSeen = new Set<string>()
+
+  // 先收集"明确出现过"的账号名：@提及、X 链接、聚合站标题人名。
+  // 只有这些名字才参与跨站一致性统计，避免把普通英文单词当账号。
+  const explicitHandles = new Set<string>()
+  const addExplicit = (raw: string | null | undefined) => {
+    const h = cleanHandle(raw)
+    if (h) explicitHandles.add(h.toLowerCase())
+  }
+  const aggTokenRoots = new Map<string, Set<string>>()
+  for (const c of candidates) {
+    addExplicit(c.authorHandle)
+    for (const m of (c.title || '').matchAll(TITLE_HANDLE_GLOBAL_RE)) addExplicit(m[1])
+    for (const m of (c.description || '').matchAll(DESC_MENTION_RE)) addExplicit(m[1])
+    const um = (c.pageUrl || '').match(X_URL_RE)
+    if (um) addExplicit(um[1])
+    if (c.engine === 'yandex') {
+      const root = domainRoot(c.pageUrl)
+      for (const m of (c.title || '').matchAll(AGG_TOKEN_RE)) {
+        const token = m[1]
+        if (!isHandleLike(token) || !AGGREGATOR_STRICT_RE.test(token)) continue
+        const roots = aggTokenRoots.get(token.toLowerCase()) || new Set<string>()
+        roots.add(root)
+        aggTokenRoots.set(token.toLowerCase(), roots)
+      }
+    }
+  }
+  // 聚合站人名必须至少出现在两个独立域名的标题里，才是"这套图的署名"，
+  // 而不是某个文件名/随机串。
+  for (const [token, roots] of aggTokenRoots) {
+    if (roots.size >= 2) explicitHandles.add(token)
+  }
+
+  // 跨站一致署名：同一个名字在多个独立域名页面的标题/摘要里反复出现，
+  // 说明这是该套图的署名，而不是某个转发页的偶然提及。
+  interface ConsensusRecord {
+    domains: Map<string, { pageUrl: string; title: string }>
+    platform: string
+    postUrl: string
+  }
+  const consensus = new Map<string, ConsensusRecord>()
 
   const author = (handle: string, platform: string): AuthorVerdict => {
     const key = `${handle.toLowerCase()}|${platform}`
@@ -138,11 +226,8 @@ export function fuse(
       a.evidence.push(`ascii2d 结果: ${c.pageUrl.slice(0, 70)}`)
       if (statusMatch && !a.postUrl) a.postUrl = statusMatch[0]
     } else if (c.engine === 'yandex') {
-      const platform = platformOf(c)
+      const platform = platformOf(c) || '未知'
       const root = domainRoot(c.pageUrl)
-      const titleMatch = (c.title || '').match(TITLE_HANDLE_RE) || c.pageUrl.match(X_URL_RE)
-      const titleHandle = titleMatch ? cleanHandle(titleMatch[1]) : ''
-
       // 1) description 强署名（credit 模式，原作者）
       for (const m of (c.description || '').matchAll(DESC_CREDIT_RE)) {
         const h = cleanHandle(m[1] || m[2])
@@ -158,68 +243,24 @@ export function fuse(
         if (statusMatch && !a.postUrl) a.postUrl = statusMatch[0]
       }
 
-      // 2) description 裸 @mention：只有与页面标题 handle 不同才算独立弱证据
-      for (const m of (c.description || '').matchAll(DESC_MENTION_RE)) {
-        const h = cleanHandle(m[1])
-        if (!h || h.toLowerCase() === titleHandle.toLowerCase()) continue
-        const a = author(h, platform)
-        a.confidence = Math.min(1, a.confidence + 0.10)
-        a.domains.add(root)
-        a.evidence.push(`正文提及: @${h}`)
-        if (!a.pageUrl) a.pageUrl = c.pageUrl
-      }
-
-      // 3) 标题/URL handle（转发者）—— 但跨域名一致性提权
-      if (titleHandle) {
-        const a = author(titleHandle, platform)
-        if (!a.domains.has(root)) {
-          a.confidence = Math.min(1, a.confidence + (a.domains.size ? 0.15 : 0.10))
-          a.domains.add(root)
-        } else {
-          a.confidence = Math.min(1, a.confidence + 0.05)
+      // 2) 记录跨站署名：已知账号名出现在标题/摘要/URL 中即记一个域名，
+      //    具体分值在循环结束后按独立域名数统一计算。
+      const text = `${c.title || ''} ${c.description || ''}`
+      for (const h of explicitHandles) {
+        if (!textMentions(text, h) && !textMentions(c.pageUrl, h)) continue
+        let rec = consensus.get(h)
+        if (!rec) {
+          rec = { domains: new Map(), platform: '', postUrl: '' }
+          consensus.set(h, rec)
         }
-        a.evidence.push(`站点署名(${root}): ${c.pageUrl.slice(0, 55)}`)
-        if (!a.pageUrl) a.pageUrl = c.pageUrl
-      }
-
-      // 4) 聚合站标题开头的 handle 形态词
-      if (!platform) {
-        for (const rawToken of (c.title || '').split(/\s+/)) {
-          const tok = rawToken
-            .replace(/^[,.;:!?()[\]{}'"`]+|[,.;:!?()[\]{}'"`]+$/g, '')
-            .split('-')[0]
-          if (!isHandleLike(tok)) continue
-          if (!AGGREGATOR_STRICT_RE.test(tok)) continue
-          const a = author(tok, '未知')
-          if (!a.domains.has(root)) {
-            a.domains.add(root)
-            if (a.domains.size >= 2) {
-              a.confidence = Math.min(0.30, a.confidence + 0.10)
-              a.evidence.push(
-                `聚合站人名(跨站一致 x${a.domains.size}): ${(c.title || '').slice(0, 50)}`,
-              )
-              if (!a.pageUrl) a.pageUrl = c.pageUrl
-            }
-          } else {
-            a.confidence = Math.min(0.30, a.confidence + 0.05)
-          }
+        if (!rec.domains.has(root)) {
+          rec.domains.set(root, {
+            pageUrl: c.pageUrl,
+            title: (c.title || c.description || '').slice(0, 60),
+          })
         }
-
-        // URL 路径中的 handle 形态段
-        for (let seg of c.pageUrl.split('/').slice(3)) {
-          seg = seg.split('?')[0]
-          const m2 = seg.match(HANDLE_PREFIX_RE)
-          if (!m2 || !isHandleLike(m2[0])) continue
-          const target = authors.get(`${m2[0].toLowerCase()}|未知`)
-          if (!target) continue // 只为已被其他证据登记的 handle 记域名
-          if (!target.domains.has(root)) {
-            target.domains.add(root)
-            if (target.domains.size >= 2) {
-              target.confidence = Math.min(0.30, target.confidence + 0.10)
-              target.evidence.push(`URL 路径含该名(${root})`)
-            }
-          }
-        }
+        if (!rec.platform) rec.platform = platform
+        if (statusMatch && !rec.postUrl) rec.postUrl = statusMatch[0]
       }
     } else if (c.engine === 'gcv') {
       const m = c.pageUrl.match(/(?:x\.com|twitter\.com)\/(\w{2,20})\/?$/)
@@ -264,6 +305,21 @@ export function fuse(
         }
       }
     }
+  }
+
+  // 跨站一致署名计分：1 个域名 +0.10，每多一个独立域名 +0.05，封顶 0.45。
+  // 这是开箱即用场景下最重要的线索：同一套图的署名会被多个聚合站反复引用。
+  for (const [h, rec] of consensus) {
+    const n = rec.domains.size
+    if (!n) continue
+    const a = author(h, rec.platform || '未知')
+    const bonus = Math.min(0.45, 0.10 + 0.05 * (n - 1))
+    a.confidence = Math.min(1, a.confidence + bonus)
+    for (const root of rec.domains.keys()) a.domains.add(root)
+    if (rec.postUrl && !a.postUrl) a.postUrl = rec.postUrl
+    const sample = [...rec.domains.values()][0]
+    if (!a.pageUrl) a.pageUrl = sample.pageUrl
+    a.evidence.push(`跨站一致署名(${n} 个独立站点): “${sample.title}”`)
   }
 
   // 感知哈希加成：转发页同样含同图，"页面含同图"≠"该页账号是作者"。
@@ -315,6 +371,13 @@ export function platformOf(c: PostCandidate): string {
 /** 强证据阈值：有正文署名/官方引擎命中/同图确认之一才作为"作者候选"展示 */
 export const STRONG_CONFIDENCE = 0.30
 
+function formatFollowers(count: number | null | undefined): string {
+  if (typeof count !== 'number' || !Number.isFinite(count)) return ''
+  if (count >= 1e8) return `${(count / 1e8).toFixed(2)} 亿`
+  if (count >= 1e4) return `${(count / 1e4).toFixed(1)} 万`
+  return String(count)
+}
+
 /** 格式化融合结果：只突出最优先一条，其余折叠。 */
 export function formatVerdicts(verdicts: AuthorVerdict[], limit = 5): string {
   if (!verdicts.length) {
@@ -334,10 +397,15 @@ export function formatVerdicts(verdicts: AuthorVerdict[], limit = 5): string {
 
   if (strong.length) {
     const best = strong[0]
-    lines.push(`最优先候选：@${best.handle}  [${best.platform}]`)
-    lines.push(`  置信度 ${best.confidence.toFixed(2)}（正文署名/官方引擎/同图确认）`)
+    const nameTag = best.profileName ? `（${best.profileName}）` : ''
+    lines.push(`最优先候选：@${best.handle}${nameTag}  [${best.platform}]`)
+    lines.push(`  置信度 ${best.confidence.toFixed(2)}（正文署名/跨站一致署名/同图确认）`)
     if (best.postUrl) lines.push(`  原帖: ${best.postUrl}`)
-    else if (best.pageUrl) lines.push(`  证据页: ${best.pageUrl}`)
+    else if (best.profileVerified) {
+      const fans = formatFollowers(best.followers)
+      lines.push(`  主页: https://x.com/${best.handle}${fans ? ` · 粉丝 ${fans}` : ''}`)
+      if (best.pageUrl) lines.push(`  证据页: ${best.pageUrl}`)
+    } else if (best.pageUrl) lines.push(`  证据页: ${best.pageUrl}`)
     for (const ev of best.evidence.slice(0, 3)) lines.push(`  · ${ev}`)
 
     const rest = strong.slice(1)
@@ -345,14 +413,16 @@ export function formatVerdicts(verdicts: AuthorVerdict[], limit = 5): string {
       lines.push(`其余 ${rest.length} 位候选（置信度较低，已折叠，仅供人工排查）：`)
       for (const v of rest.slice(0, Math.max(0, limit - 1))) {
         const post = v.postUrl || v.pageUrl
-        lines.push(`  - @${v.handle}  [${v.platform}]  ${v.confidence.toFixed(2)}  ${post}`)
+        const name = v.profileName ? `（${v.profileName}）` : ''
+        lines.push(`  - @${v.handle}${name}  [${v.platform}]  ${v.confidence.toFixed(2)}  ${post}`)
       }
     }
   } else {
     lines.push('未找到可靠署名证据（无正文 credit、无官方引擎命中、无同图确认）。')
     lines.push('以下仅为结果页中出现过的账号，多为转发者，低可信：')
     for (const v of weak.slice(0, limit)) {
-      lines.push(`  ? @${v.handle}  [${v.platform}]  置信度 ${v.confidence.toFixed(2)}`)
+      const name = v.profileName ? `（${v.profileName}）` : ''
+      lines.push(`  ? @${v.handle}${name}  [${v.platform}]  置信度 ${v.confidence.toFixed(2)}`)
     }
   }
 

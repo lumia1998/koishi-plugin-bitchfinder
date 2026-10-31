@@ -39,6 +39,7 @@ export interface Config {
   serpapiApiKey: string
   serpapiVisualMatches: boolean
   keylessGoogleLens: boolean
+  verifyXProfile: boolean
   useLlmCandidates: boolean
   model: string
   followerTiebreak: boolean
@@ -76,7 +77,7 @@ export const Config: Schema<Config> = Schema.intersect([
     serpapiApiKey: Schema.string()
       .role('secret')
       .default('')
-      .description('SerpApi API Key，用于 Google Lens exact_matches（付费）。'),
+      .description('SerpApi API Key，用于 Google Lens exact_matches（付费）。图片由插件直接上传（自动压到 500 KB 内），不依赖 Yandex 图床。'),
     ascii2dMode: Schema.union([
       Schema.const('default').description('默认：不携带 Cookie（与 flj_finder 一致）'),
       Schema.const('cookie').description('Cookie 模式：携带下方 cf_clearance'),
@@ -92,6 +93,9 @@ export const Config: Schema<Config> = Schema.intersect([
     keylessGoogleLens: Schema.boolean()
       .default(true)
       .description('启用免 Key Google Lens（直接上传图片解析结果页，开箱即用；部分出口 IP 会收到验证页）。'),
+    verifyXProfile: Schema.boolean()
+      .default(true)
+      .description('用 fxTwitter 公开资料页核实候选账号（昵称/粉丝），无需 key；用于确认"页面署名"与 X 账号是否同一人。'),
     serpapiVisualMatches: Schema.boolean()
       .default(false)
       .description('Google Lens 同时查询 visual_matches（相似图，线索噪声较多）。'),
@@ -120,6 +124,7 @@ function createSearchConfig(config: Config): SearchConfig {
     serpapiApiKey: config.serpapiApiKey,
     serpapiVisualMatches: config.serpapiVisualMatches,
     keylessGoogleLens: config.keylessGoogleLens,
+    verifyXProfile: config.verifyXProfile,
     useLlmCandidates: config.useLlmCandidates,
     followerTiebreak: config.followerTiebreak,
   }

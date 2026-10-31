@@ -11,12 +11,17 @@
 
 ## 特性
 
-- **多引擎并发**：Yandex、Google Lens（免 Key，开箱即用）、ASCII2D、SauceNAO、
-  Google Cloud Vision、Google Lens (SerpApi)。
+- **多引擎并发、彼此独立**：Yandex、Google Lens（免 Key，开箱即用）、ASCII2D、SauceNAO、
+  Google Cloud Vision、Google Lens (SerpApi)。每个引擎直接上传图片字节，
+  **不依赖 Yandex 是否成功、也不依赖第三方图床**；任一引擎被拦不影响其余引擎。
 - **开箱即用**：不配置任何 Key 也能工作——Yandex + 免 Key Google Lens + ascii2d 默认启用；
   配置 SauceNAO / SerpApi 后可进一步提升原帖命中率。
-- **证据融合而非"投票"**：正文署名、官方索引作者、标题/URL 中的账号、感知哈希同图确认分别计分，
+- **证据融合而非"投票"**：正文署名、官方索引作者、跨站一致署名、感知哈希同图确认分别计分，
   转发者不会被误判为原作者。
+- **跨站一致署名**：同一个账号名在多个独立域名页面的标题/摘要里反复出现时，
+  按独立站点数加权（+0.10 ~ +0.45）——这是聚合站场景下最有效的开箱即用线索。
+- **X 资料页核实**：用 fxTwitter 公开接口确认候选 handle 真实存在，并用显示昵称
+  与出处页文字交叉核对；昵称一致时加分，也可把"站内人名"升级为确切的 X 账号。
 - **感知哈希硬确认**：aHash + dHash（64 位）校验候选页面中的图片是否与查询图同图，
   为跨站一致证据加权。
 - **X 账号粉丝数 tie-break**：最优先两名候选置信度并列且都是 X 账号时，取粉丝数更多者
@@ -112,7 +117,7 @@ kfc             # 别名
 | --- | --- |
 | `saucenaoApiKey` | SauceNAO API Key（[免费申请](https://saucenao.com/user.php?page=search-api)，100 次/天）。**强烈建议配置**，对 X / Pixiv 原帖命中率提升最大 |
 | `gcvApiKey` | Google Cloud Vision API Key（启用 `WEB_DETECTION`，付费） |
-| `serpapiApiKey` | SerpApi Key，用于 Google Lens `exact_matches`（付费） |
+| `serpapiApiKey` | SerpApi Key，用于 Google Lens `exact_matches`（付费）。图片经 SerpApi Image API 直传（≤500 KB，超出自动压缩），不依赖 Yandex 图床 |
 | `ascii2dMode` | ascii2d 请求模式：`default` 不携带 Cookie（与 flj_finder 一致，默认）；`cookie` 携带下方 `cf_clearance` |
 | `ascii2dCookie` | ascii2d 的 Cloudflare `cf_clearance` cookie，仅在 `cookie` 模式下使用 |
 
@@ -121,6 +126,7 @@ kfc             # 别名
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
 | `keylessGoogleLens` | `true` | 免 Key Google Lens：直接上传图片解析 exact_matches 结果页，不依赖任何 Key |
+| `verifyXProfile` | `true` | 用 fxTwitter 公开资料页核实候选账号（昵称/粉丝），无需 Key；用于确认"页面署名"与 X 账号是否同一人 |
 | `serpapiVisualMatches` | `false` | Google Lens 同时查询相似图（噪声较多） |
 
 ### ChatLuna / LLM
@@ -135,23 +141,31 @@ kfc             # 别名
 1. **预处理**：读取 EXIF 方向；符合条件（JPEG/PNG/WebP、最长边 ≤1600px、方向正常）的图片
    保留原始字节——重新编码会改变图像内容、伤害反搜命中率；其余图片纠正方向、缩放、
    透明区填白转 JPEG、动图取第一帧。
-2. **Yandex 首发**：上传图片，取得 Yandex 托管的公网原图 URL（供 SauceNAO / SerpApi Lens 使用），
-   并解析相似站点列表；`.com` / `.ru` 双域名互备，验证页与"无结果"区分处理。
+2. **Yandex 首发**：上传图片并解析相似站点列表；`.com` / `.ru` 双域名互备，
+   验证页与"无结果"区分处理。它不再是其他引擎的前置条件。
 3. **其余引擎并发**：各引擎独立，任一失败只影响自身；失败原因会附在结果末尾，
-   便于区分"确实没有署名"与"引擎被风控拦截"。免 Key Google Lens 与 ascii2d
-   直接使用图片字节，**不依赖 Yandex 是否成功**。
+   便于区分"确实没有署名"与"引擎被风控拦截"。
+   - 免 Key Google Lens、ascii2d、Google Vision：直接使用图片字节；
+   - SauceNAO：multipart 直传（`file` 字段），不借道 Yandex 图床；
+   - SerpApi Lens：先上传到 SerpApi Image API 取 `image_id`（自动压缩到 ≤500 KB），
+     再用 `image_id` 查询，同样不依赖 Yandex。
 4. **感知哈希确认**：aHash + dHash 校验候选账号页面中的图片与查询图相似度。
 5. **融合评分**：
    - 正文署名（sc/credit/source/via…）：每处 +0.35
    - SauceNAO 官方索引作者：+0.45
    - Google Lens 完全匹配到 X 原帖 / 主页：+0.30 / +0.20（免 Key 与 SerpApi 同索引，按结果页去重）
    - ascii2d 结果作者：+0.30
-   - 标题 / URL 中账号：+0.05 ~ +0.15（跨域名一致才提权）
+   - 跨站一致署名：出现在 1 个独立域名 +0.10，每多一个域名 +0.05，封顶 +0.45
    - 感知哈希同图：≥0.90 且跨 ≥2 域 +0.20；单域 +0.10；0.75–0.90 +0.05
-   - 聚合站站内人名（无平台归属）置信度封顶 0.30
-6. **粉丝 tie-break**：置信度并列的 X 账号取粉丝数更多者。
-7. **LLM 兜底**（可选）：无强证据时让模型从来源文字中提取账号候选，逐条校验 evidence。
-8. **输出**：最优先候选 + 折叠的低可信候选 + Yandex 出处列表 + 引擎状态。
+   - 聚合站站内人名必须至少出现在 2 个独立域名的标题里，才计入跨站一致署名
+   - X 资料页确认：昵称与 ≥2 个出处页文字一致 +0.15（≥3 个 +0.20）
+6. **X 资料页核实**：对得分前列的候选查询 fxTwitter，补全显示昵称、粉丝数与主页链接；
+   昵称对得上时把"站内人名"认定为该 X 账号。
+7. **粉丝 tie-break**：置信度并列的 X 账号取粉丝数更多者。
+8. **LLM 兜底**（可选）：无强证据时让模型从来源文字中提取账号候选，逐条校验 evidence。
+9. **输出**：最优先候选 + 折叠的低可信候选 + Yandex 出处列表 + 引擎状态。
+   出处列表同样按可信度排序，并标注与强候选的关系（`含 @handle 署名` /
+   `@handle 出处站` / `提及 @handle`），无关页面排在最后。
 
 ## 已知限制
 
@@ -160,6 +174,8 @@ kfc             # 别名
 - 免 Key Google Lens 依赖解析 Google 结果页：部分出口 IP 会收到"需要启用 JavaScript"
   的验证页（与 flj_finder 的情况一致），此时该引擎会明确报错，而不是伪报"无结果"；
   可更换代理或配置 SerpApi 作为替代。
+- SerpApi 的上传接口限制单张 ≤500 KB，超过时插件会自动缩放/降质；
+  极端情况下压缩后的图与原图略有差异，理论上可能影响少量精确匹配。
 - ascii2d 默认按无 Cookie 方式请求，可能被 Cloudflare 拦截（默认模式下只在日志提示）；
   需要时把 `ascii2dMode` 切到 `cookie` 并填写 `cf_clearance`。
 - 合并转发使用 Satori 的 `figure` 元素，目前实测在 OneBot / Red 适配器生效；其他适配器会回退为普通消息。

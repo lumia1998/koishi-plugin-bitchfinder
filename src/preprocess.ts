@@ -48,6 +48,62 @@ export async function prepareImage(data: Buffer): Promise<Buffer> {
   }
 }
 
+/** 按文件头判断图片格式（不依赖扩展名/媒体类型声明）。 */
+export function imageFormat(
+  data: Buffer,
+): 'jpeg' | 'png' | 'webp' | 'gif' | 'unknown' {
+  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+    return 'jpeg'
+  }
+  if (
+    data.length >= 8 &&
+    data[0] === 0x89 &&
+    data[1] === 0x50 &&
+    data[2] === 0x4e &&
+    data[3] === 0x47
+  ) {
+    return 'png'
+  }
+  if (
+    data.length >= 12 &&
+    data.toString('ascii', 0, 4) === 'RIFF' &&
+    data.toString('ascii', 8, 12) === 'WEBP'
+  ) {
+    return 'webp'
+  }
+  if (data.length >= 6 && data.toString('ascii', 0, 3) === 'GIF') return 'gif'
+  return 'unknown'
+}
+
+/**
+ * 把图片压到 maxBytes 以内，供对上传体积有硬限制的接口使用
+ * （例如 SerpApi Image API 限 500 KB、仅接受 JPG/PNG/WebP）。
+ * 已在限制内则原样返回，避免不必要的重编码。
+ */
+export async function compressToMaxBytes(
+  data: Buffer,
+  maxBytes: number,
+  force = false,
+): Promise<Buffer> {
+  if (!force && data.length <= maxBytes) return data
+  for (const side of [1600, 1200, 960, 720, 480]) {
+    for (const quality of [90, 80, 70, 60]) {
+      try {
+        const out = await sharp(data, { animated: false, failOn: 'none' })
+          .rotate()
+          .flatten({ background: '#ffffff' })
+          .resize(side, side, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality })
+          .toBuffer()
+        if (out.length <= maxBytes) return out
+      } catch {
+        return data
+      }
+    }
+  }
+  return data
+}
+
 export interface PerceptualHashes {
   a: bigint
   d: bigint

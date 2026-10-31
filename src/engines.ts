@@ -8,6 +8,7 @@
 import { DomUtils, parseDocument } from 'htmlparser2'
 
 import { HttpClient } from './http'
+import { compressToMaxBytes, imageFormat } from './preprocess'
 import { EngineError, PostCandidate } from './types'
 
 // ---------------------------------------------------------------------------
@@ -151,25 +152,65 @@ export function parseYandexHtml(html: string): PostCandidate[] {
 // SauceNAO：官方 API，直接返回作者与原帖 URL（X status / Pixiv artwork）
 // ---------------------------------------------------------------------------
 
+/** multipart 上传用的媒体类型与文件名，按实际文件头决定。 */
+function uploadMeta(data: Buffer): { mime: string; filename: string } {
+  const fmt = imageFormat(data)
+  if (fmt === 'png') return { mime: 'image/png', filename: 'image.png' }
+  if (fmt === 'webp') return { mime: 'image/webp', filename: 'image.webp' }
+  return { mime: 'image/jpeg', filename: 'image.jpg' }
+}
+
 export async function searchSaucenao(
   http: HttpClient,
-  imageUrl: string,
+  image: Buffer | string,
   options: { apiKey: string; timeout?: number; proxy?: string },
 ): Promise<PostCandidate[]> {
   if (!options.apiKey) {
     throw new EngineError('SauceNAO 需要 api_key（saucenao.com 免费注册，100 次/天）')
   }
-  const data = await http.getJson('https://saucenao.com/search.php', {
-    timeout: options.timeout,
-    proxy: options.proxy,
-    query: {
-      db: 999,
-      output_type: 2,
-      numres: 16,
-      api_key: options.apiKey,
-      url: imageUrl,
-    },
-  })
+  // 本地字节直传（multipart file），不依赖任何第三方图床；
+  // 传 URL 时走 SauceNAO 的 url 参数（保留给已有外链的场景）。
+  let data: any
+  if (Buffer.isBuffer(image)) {
+    const meta = uploadMeta(image)
+    const resp = await http.postFile('https://saucenao.com/search.php', 'file', image, {
+      timeout: options.timeout,
+      proxy: options.proxy,
+      filename: meta.filename,
+      contentType: meta.mime,
+      extraFields: {
+        db: '999',
+        output_type: '2',
+        numres: '16',
+        api_key: options.apiKey,
+      },
+    })
+    const text = await resp.text()
+    try {
+      data = JSON.parse(text)
+    } catch {
+      throw new EngineError(`SauceNAO 响应异常(HTTP ${resp.status}): ${text.slice(0, 120)}`)
+    }
+    // SauceNAO 对无效 key 返回 HTTP 403 + header.message，优先展示原因
+    const header = data?.header || {}
+    if (header.status !== undefined && Number(header.status) !== 0) {
+      throw new EngineError(
+        `SauceNAO: ${header.message || `status=${header.status}`}`,
+      )
+    }
+  } else {
+    data = await http.getJson('https://saucenao.com/search.php', {
+      timeout: options.timeout,
+      proxy: options.proxy,
+      query: {
+        db: 999,
+        output_type: 2,
+        numres: 16,
+        api_key: options.apiKey,
+        url: image,
+      },
+    })
+  }
 
   const status = data?.header?.status
   if (status !== undefined && status !== null && Number(status) !== 0) {
@@ -335,7 +376,7 @@ export async function searchGcv(
 
 export async function searchGoogleLens(
   http: HttpClient,
-  imageUrl: string,
+  image: Buffer | string,
   options: {
     apiKey: string
     visualMatches?: boolean
@@ -344,6 +385,40 @@ export async function searchGoogleLens(
   },
 ): Promise<PostCandidate[]> {
   if (!options.apiKey) throw new EngineError('Google Lens 需要 serpapi_api_key')
+
+  // 本地字节 → SerpApi Image API 上传拿 image_id（独立于 Yandex 图床）。
+  // 上传限制：JPG/PNG/WebP，≤500 KB，image_id 10 分钟有效。
+  let imageId = ''
+  if (Buffer.isBuffer(image)) {
+    // SerpApi 只收 JPG/PNG/WebP 且 ≤500 KB：格式不支持或超限时强制转 JPEG
+    const fmt = imageFormat(image)
+    const allowed = fmt === 'jpeg' || fmt === 'png' || fmt === 'webp'
+    const needsConvert = !allowed || image.length > 500 * 1024
+    const payload = needsConvert
+      ? await compressToMaxBytes(image, 500 * 1024, true)
+      : image
+    const meta = uploadMeta(payload)
+    const resp = await http.postFile('https://serpapi.com/image', 'image', payload, {
+      timeout: options.timeout,
+      proxy: options.proxy,
+      filename: meta.filename,
+      contentType: meta.mime,
+      extraFields: { api_key: options.apiKey },
+    })
+    const text = await resp.text()
+    let upload: any
+    try {
+      upload = JSON.parse(text)
+    } catch {
+      upload = undefined
+    }
+    imageId = String(upload?.image_id || '')
+    if (!imageId) {
+      const reason =
+        upload?.error || upload?.message || text.slice(0, 120) || '未知错误'
+      throw new EngineError(`SerpApi 图片上传失败(HTTP ${resp.status}): ${reason}`)
+    }
+  }
 
   const kinds: Array<[string, number]> = [['exact_matches', 0.45]]
   if (options.visualMatches) kinds.push(['visual_matches', 0.15])
@@ -357,7 +432,9 @@ export async function searchGoogleLens(
       query: {
         engine: 'google_lens',
         type: kind,
-        url: imageUrl,
+        ...(imageId
+          ? { image_id: imageId }
+          : { url: typeof image === 'string' ? image : '' }),
         safe: 'off',
         api_key: options.apiKey,
       },
