@@ -1,4 +1,6 @@
 // 取图：命令参数 / 被引用的消息 / 当前消息里的图片 → bytes + mimeType。
+import fs from 'node:fs'
+import path from 'node:path'
 import type { Context, Session } from 'koishi'
 import { looksLikeImageBuffer, safeFetchBuffer } from './safe-fetch'
 
@@ -35,6 +37,30 @@ export async function imageFromUrl(input: string): Promise<ImageInput> {
     return { bytes, mimeType: sniffMime(bytes) }
   }
   throw new Error('只支持 http(s) 图片地址或 base64 图片')
+}
+
+/**
+ * 本机文件路径取图 —— 只给 ChatLuna 工具用（agent 本来就有文件权限，不增加攻击面），
+ * 「找鸡」命令不走这条路：普通用户给个路径就能读服务器任意文件，那是漏洞。
+ */
+export async function imageFromPath(input: string, baseDir: string): Promise<ImageInput> {
+  let file = String(input ?? '').trim()
+  const fileUrl = file.match(/^file:\/\/+(.+)$/i)
+  if (fileUrl) file = decodeURIComponent(fileUrl[1])
+  const resolved = path.isAbsolute(file) ? file : path.resolve(baseDir, file)
+  let stat: fs.Stats
+  try {
+    stat = fs.statSync(resolved)
+  } catch {
+    throw new Error(`本机没有这个文件：${file}`)
+  }
+  if (!stat.isFile()) throw new Error('那个路径不是文件')
+  if (stat.size > MAX_IMAGE_BYTES) {
+    throw new Error(`图太大了（${(stat.size / 1024 / 1024).toFixed(1)}MB，上限 20MB）`)
+  }
+  const bytes = fs.readFileSync(resolved)
+  if (!bytes.length || !looksLikeImageBuffer(bytes)) throw new Error('那个文件不是图片')
+  return { bytes, mimeType: sniffMime(bytes) }
 }
 
 interface MessageElement {
