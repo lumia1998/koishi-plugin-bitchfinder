@@ -433,7 +433,7 @@ export function displayHandle(account: Account): string {
 
 /**
  * 拼回话。账号回复按用户指定的固定版式：
- *   🎯 **鱼鱼找鸡结果**
+ *   🎯 **找鸡结果**
  *   🌐 平台：…
  *   👤 名字：…
  *   🆔 账号：…（主页链接跟在账号后面，方便点开核对）
@@ -480,7 +480,7 @@ export function formatReply({ accounts = [], candidates = [], enginesUsed = [], 
         `🆔 账号：${handle}${guess}`
       ].join('\n')
     })
-    const head = `🎯 **鱼鱼找鸡结果**${cached ? '（缓存）' : ''}`
+    const head = `🎯 **找鸡结果**${cached ? '（缓存）' : ''}`
     let text = [head, '', blocks.join('\n\n')].join('\n')
     // 只有画作平台的结果时，得说清楚这不是 coser 本人的号
     if (list.every((account) => ARTWORK_PLATFORMS.has(account?.platform))) {
@@ -501,7 +501,7 @@ export function formatReply({ accounts = [], candidates = [], enginesUsed = [], 
     : (candidates?.length ?? 0) > 0
       ? `❌ 没查到账号。${tried}${cacheTag}翻到 ${candidates.length} 条相似图，但没有能确认的账号${why ? ' ' + why : ''}`
       : `❌ 没查到账号。${tried}${cacheTag}，都空——这种一般是私图、新图，或者裁过${why ? ' ' + why : ''}`
-  const lines = [`🎯 **鱼鱼找鸡结果**`, '', head]
+  const lines = [`🎯 **找鸡结果**`, '', head]
   if (Number(artworkDropped) > 0) {
     lines.push(`只翻到 ${Number(artworkDropped)} 张相似画作（相似度不够，没当成图源）；真人 coser 的号一般在推特`)
   }

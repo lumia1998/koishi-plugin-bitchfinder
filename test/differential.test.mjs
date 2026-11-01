@@ -247,7 +247,9 @@ if (!fs.existsSync(ORIG_FILE)) {
         droppedHandles: combo.droppedHandles,
         consensusName: combo.consensusName
       }
-      cmp(() => portAccounts.formatReply(structuredClone(opts)), () => orig.formatReply(structuredClone(opts)))
+      // 有意差异：移植版标题是「找鸡结果」，原版是「鱼鱼找鸡结果」——归一化后比对其余全部
+      const normalizeReply = (s: any) => String(s).replace(/\*\*鱼鱼找鸡结果\*\*/g, '**找鸡结果**')
+      cmp(() => normalizeReply(portAccounts.formatReply(structuredClone(opts))), () => normalizeReply(orig.formatReply(structuredClone(opts))))
     }
   }
 
