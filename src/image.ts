@@ -2,7 +2,12 @@
 import type { Context, Session } from 'koishi'
 import { looksLikeImageBuffer, safeFetchBuffer } from './safe-fetch'
 
-export interface ImageInput { bytes: Buffer; mimeType: string }
+export interface ImageInput {
+  bytes: Buffer
+  mimeType: string
+  /** 图的公网地址（QQ 图链、命令里直接给的网址）。有它 SerpApi 才能自己抓图。 */
+  url?: string
+}
 export const MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
 /** 按文件头认格式，不信扩展名 —— 有人把 png 存成 .jpg，反查接口会直接拒。 */
@@ -18,7 +23,7 @@ export async function imageFromUrl(input: string): Promise<ImageInput> {
   if (/^https?:\/\//i.test(url)) {
     // http(s) → safeFetchBuffer（SSRF 防护；这些 URL 来自用户/LLM）
     const got = await safeFetchBuffer(url, MAX_IMAGE_BYTES)
-    return { bytes: got.buffer, mimeType: sniffMime(got.buffer) }
+    return { bytes: got.buffer, mimeType: sniffMime(got.buffer), url }
   }
   if (/^base64:\/\//i.test(url)) {
     const bytes = Buffer.from(url.slice(9), 'base64')
@@ -84,5 +89,5 @@ export async function imageFromSession(ctx: Context, session: Session): Promise<
   if (!looksLikeImageBuffer(bytes) && !/^image\//.test(mime)) {
     throw new Error(`那个地址不是图片（${mime}）`)
   }
-  return { bytes, mimeType: sniffMime(bytes) }
+  return { bytes, mimeType: sniffMime(bytes), url: /^https?:\/\//i.test(src) ? src : undefined }
 }

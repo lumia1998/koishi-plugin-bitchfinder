@@ -85,6 +85,58 @@ export const LENS_SOCIAL_RE = /^(x|twitter|推特|instagram|ig|ins|微博|weibo|
 // 已经解出真实域名时用它判断「这条是不是社交站点」，比看标题更可靠
 export const LENS_SOCIAL_HOST_RE = /^https?:\/\/(?:www\.|m\.)?(?:x|twitter|instagram|weibo|bilibili|tiktok|facebook|threads|xiaohongshu)\.(?:com|net)\//i
 
+// ── Google Lens（SerpApi 通道）─────────────────────────────────────────────
+// SerpApi 是谷歌结果的官方第三方 API（付费，免费档 100 次/月）。它只吃「公网可
+// 访问的图片 URL」——SerpApi 的抓取器自己去拉图，所以 base64/本地图用不了这条。
+// type=exact_matches 对应浏览器 Lens 的 udm=48 完全匹配；空结果时再要一份视觉匹配。
+export async function serpapiLensSearch(imageUrl: string, { apiKey, timeoutMs = 45000 }: { apiKey: string; timeoutMs?: number }): Promise<Candidate[]> {
+  const key = String(apiKey ?? '').trim()
+  if (!key) throw new Error('Google Lens(SerpApi) 需要 serpapiKey')
+  const fetchKind = async (type: string) => {
+    const url = new URL('https://serpapi.com/search.json')
+    url.searchParams.set('engine', 'google_lens')
+    if (type) url.searchParams.set('type', type)
+    url.searchParams.set('url', imageUrl)
+    url.searchParams.set('safe', 'off')
+    url.searchParams.set('hl', 'zh-CN')
+    url.searchParams.set('api_key', key)
+    await validateFetchUrl(url.href)
+    const response = await fetch(url.href, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(Math.max(timeoutMs, 15000))
+    })
+    if (!response.ok) throw new Error(`Google Lens(SerpApi) HTTP ${response.status}（key 无效或额度耗尽）`)
+    const data: any = await response.json()
+    if (data?.error) throw new Error(`Google Lens(SerpApi)：${String(data.error).slice(0, 120)}`)
+    return data
+  }
+  const seen = new Set<string>()
+  const rows: Candidate[] = []
+  const collect = (items: any[]) => {
+    for (const item of items ?? []) {
+      const link = String(item?.link ?? '')
+      const source = item?.source
+      const page = String(typeof source === 'object' && source ? source.link || link : link)
+      if (!/^https?:\/\//.test(page) || seen.has(page)) continue
+      seen.add(page)
+      rows.push({
+        url: page,
+        title: String((typeof source === 'object' && source ? source.name : '') || item?.title || '').slice(0, 200),
+        similarity: null,
+        sourceUrl: page
+      })
+    }
+  }
+  const exact = await fetchKind('exact_matches')
+  collect(exact?.exact_matches)
+  if (!rows.length) {
+    const visual = await fetchKind('')
+    collect(visual?.visual_matches)
+    collect(visual?.exact_matches)
+  }
+  return rows.slice(0, 24)
+}
+
 interface LensOptions {
   hl?: string
   timeoutMs?: number
@@ -458,12 +510,16 @@ export interface ReverseSearchResult {
  * 反查一张图。引擎选择由调用方从配置读出后传进来。
  * 单个引擎失败不影响其它引擎；全失败返回 failures 说明原因。
  */
-export async function reverseSearch(bytes: Buffer, mimeType: string, { engines, timeoutMs = 25000, onLog, browser, tempDir }: {
+export async function reverseSearch(bytes: Buffer, mimeType: string, { engines, timeoutMs = 25000, onLog, browser, tempDir, lensUrl, serpapiKey }: {
   engines?: string[]
   timeoutMs?: number
   onLog?: (line: string) => void
   browser?: FishBrowser
   tempDir?: string
+  /** 图片的公网 URL（有它 SerpApi 通道才可用） */
+  lensUrl?: string
+  /** SerpApi key：填了且 lensUrl 存在时 Lens 走 API，失败回退浏览器 */
+  serpapiKey?: string
 } = {}): Promise<ReverseSearchResult> {
   const list = (Array.isArray(engines) && engines.length ? engines : ['saucenao'])
     .filter((id) => (ENGINE_IDS as readonly string[]).includes(id))
@@ -476,6 +532,14 @@ export async function reverseSearch(bytes: Buffer, mimeType: string, { engines, 
     if (engine === 'iqdb') return iqdbSearch(bytes, mimeType, { timeoutMs, onLog })
     if (engine === 'tracemoe') return tracemoeSearch(bytes, mimeType, { timeoutMs })
     if (engine === 'lens') {
+      const key = String(serpapiKey ?? '').trim()
+      if (key && lensUrl) {
+        try {
+          return await serpapiLensSearch(lensUrl, { apiKey: key, timeoutMs: Math.max(timeoutMs, 30000) })
+        } catch (error) {
+          onLog?.(`[鱼鱼找鸡] lens(SerpApi) 不可用，回退浏览器：${String((error as Error)?.message ?? error)}`)
+        }
+      }
       return googleLensSearch(browser!, bytes, mimeType, { timeoutMs: Math.max(timeoutMs, 30000), tempDir })
     }
     if (engine === 'baidu') {

@@ -7,6 +7,8 @@ import { hostOf } from './utils'
 export const UPLOAD_HOSTS = [
   'saucenao.com', 'yandex.com', 'yandex.ru', 'bing.com', 'baidu.com', 'google.com', 'lens.google.com',
   'iqdb.org', 'trace.moe',
+  // SerpApi 的 Google Lens API：不传图片字节，只给图片的公网 URL 让它自己抓
+  'serpapi.com',
   // 搜索类（只在 need-search 的场合用：必应/谷歌/DDG/Brave/Startpage）
   'duckduckgo.com', 'brave.com', 'startpage.com'
 ]

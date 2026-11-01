@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-bitchfinder",
   "description": "鱼鱼找鸡：给一张图，反查这人是哪个 coser、账号在哪（谷歌 Lens / SauceNAO / trace.moe 多引擎，零 token）",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [

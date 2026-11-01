@@ -26,6 +26,7 @@ export const usage = `给一张图，反查这人是哪个 coser、账号在哪�
 
 export interface Config {
   engines: EngineId[]
+  serpapiKey: string
   timeoutMs: number
   maxAccounts: number
   strictConsensus: boolean
@@ -43,6 +44,7 @@ export const Config: Schema<Config> = Schema.object({
     Schema.const('iqdb').description('IQDB（动漫图库，直连，常排队）'),
     Schema.const('baidu').description('百度识图（很慢）'),
   ])).role('checkbox').default(['lens', 'saucenao', 'tracemoe']).description('用哪些引擎。Lens 和百度走 puppeteer 浏览器，其余直接 HTTP。'),
+  serpapiKey: Schema.string().role('secret').default('').description('可选：SerpApi 的 Google Lens key（付费 API，免费档每月 100 次）。填了且图片有公网地址时，Lens 走 SerpApi 不依赖能连谷歌的浏览器；失败自动回退浏览器 Lens。base64/本地图没有公网地址，只能走浏览器。'),
   timeoutMs: Schema.natural().role('ms').default(45000).description('单个引擎的超时（Lens/百度至少按 30 秒算）。'),
   maxAccounts: Schema.natural().min(1).default(3).description('最多报几个账号。'),
   strictConsensus: Schema.boolean().default(true).description('开 = 名字对不上的别人的号不报（少报不错报）；关 = 全都报出来自己挑。'),
@@ -67,6 +69,8 @@ export function apply(ctx: Context, config: Config) {
       engines: config.engines,
       timeoutMs: config.timeoutMs,
       browser,
+      lensUrl: image.url,
+      serpapiKey: config.serpapiKey,
       onLog: (line) => logger.info(line)
     })
     const accounts = extractAccounts(result.candidates, { max: config.maxAccounts, strictNames: config.strictConsensus !== false })

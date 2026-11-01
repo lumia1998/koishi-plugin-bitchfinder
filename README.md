@@ -31,6 +31,7 @@
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | `engines` | `lens, saucenao, tracemoe` | 用哪些引擎。Lens 和百度走 puppeteer 浏览器，其余直接 HTTP |
+| `serpapiKey` | 空 | 可选：SerpApi 的 Google Lens key（付费 API，免费档每月 100 次）。填了且图片有公网地址时 Lens 走 SerpApi，不依赖能连谷歌的浏览器；失败自动回退浏览器 Lens。base64/本地图没有公网地址，只能走浏览器 |
 | `timeoutMs` | `45000` | 单个引擎的超时（Lens/百度至少按 30 秒算） |
 | `maxAccounts` | `3` | 最多报几个账号 |
 | `strictConsensus` | `true` | 开 = 名字对不上的别人的号不报（少报不错报）；关 = 全都报出来自己挑 |
