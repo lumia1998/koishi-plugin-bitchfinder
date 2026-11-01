@@ -1,21 +1,19 @@
 {
   "name": "koishi-plugin-bitchfinder",
-  "description": "反向图片搜索：发送图片，多引擎查找出处与作者账号（含 X 原帖、Coser 主页署名）",
-  "version": "1.0.2",
+  "description": "鱼鱼找鸡：给一张图，反查这人是哪个 coser、账号在哪（谷歌 Lens / SauceNAO / trace.moe 多引擎，零 token）",
+  "version": "2.0.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
-    "lib",
-    "sample.png",
-    "evidence.png"
+    "lib"
   ],
   "license": "AGPL-3.0",
   "engines": {
     "node": ">=18.17.0"
   },
-  "author": "lumia1998 (Koishi port) / vmoranv (original AstrBot plugin)",
+  "author": "lumia1998 (Koishi port)",
   "contributors": [
-    "vmoranv <https://github.com/vmoranv>"
+    "小鲸鱼 (original 鱼鱼找鸡, MIT)"
   ],
   "repository": {
     "type": "git",
@@ -29,24 +27,23 @@
     "chatbot",
     "koishi",
     "plugin",
-    "image",
     "reverse-image-search",
+    "coser",
+    "google-lens",
     "saucenao",
-    "yandex",
-    "chatluna",
-    "tool"
+    "tracemoe",
+    "puppeteer",
+    "chatluna"
   ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc -w",
     "clean": "rimraf lib",
+    "test": "npm run build && node --test test/differential.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@langchain/core": "^0.3.62",
-    "htmlparser2": "^10.1.0",
-    "sharp": "^0.34.2",
-    "undici": "^6.21.0",
     "zod": "^3.25.76"
   },
   "peerDependencies": {
@@ -59,18 +56,22 @@
     }
   },
   "devDependencies": {
+    "@koishijs/plugin-mock": "^2.6.6",
     "@types/node": "^22.10.0",
     "koishi": "^4.18.9",
     "koishi-plugin-chatluna": "^1.4.4",
+    "koishi-plugin-puppeteer": "^3.9.0",
     "rimraf": "^5.0.5",
     "typescript": "^5.9.3"
   },
   "koishi": {
     "description": {
-      "zh": "反向图片搜索：发送图片，多引擎查找图片出处与作者账号（含 X 原帖、Coser 主页署名）。可选注册 ChatLuna 工具 findbitch。"
+      "zh": "鱼鱼找鸡：引用一张图发「找鸡」，多引擎反查 coser 的社媒账号（谷歌 Lens / SauceNAO / trace.moe）。可选注册 ChatLuna 工具 findbitch。"
     },
     "service": {
-      "required": [],
+      "required": [
+        "puppeteer"
+      ],
       "optional": [
         "chatluna"
       ],

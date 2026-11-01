@@ -1,0 +1,4 @@
+{ "candidates": [
+  { "engine": "saucenao", "similarity": 0.7, "title": "Some Article", "sourceUrl": "https://example.com/a?b=1&c=2", "links": ["https://example.com/a?b=1&c=2"] },
+  { "engine": "iqdb", "similarity": 0.95, "title": "danbooru post", "sourceUrl": "https://danbooru.donmai.us/posts/123", "links": ["https://danbooru.donmai.us/posts/123"] }
+] }

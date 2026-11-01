@@ -1,634 +1,530 @@
-/**
- * 多引擎反搜适配层。
- *
- * 每个引擎独立实现，返回统一的 PostCandidate 列表；任何引擎失败
- * （网络、风控、缺 key）都只影响自身，不影响其他引擎。
- */
-
-import { DomUtils, parseDocument } from 'htmlparser2'
-
-import { HttpClient } from './http'
-import { compressToMaxBytes, imageFormat } from './preprocess'
-import { EngineError, PostCandidate } from './types'
-
-// ---------------------------------------------------------------------------
-// Yandex（.com 与 .ru 同一 CBIR 后端，双域名互备）
-// ---------------------------------------------------------------------------
-
-const YANDEX_UPLOAD_REQUEST = JSON.stringify({
-  blocks: [{ block: 'b-page_type_search-by-image__link' }],
-})
-const YANDEX_HOSTS = ['yandex.com', 'yandex.ru']
-
-function quoteKeepUrlChars(value: string): string {
-  return encodeURIComponent(value).replace(/%3D/g, '=').replace(/%26/g, '&')
-}
-
-export async function searchYandex(
-  http: HttpClient,
-  image: Buffer,
-  options: { timeout?: number; proxy?: string; host?: string } = {},
-): Promise<{ resultUrl: string; candidates: PostCandidate[] }> {
-  const host = options.host || 'yandex.com'
-  const hosts = [host, ...YANDEX_HOSTS.filter((h) => h !== host)]
-  let lastError: unknown
-  for (const h of hosts) {
-    try {
-      return await searchYandexOn(http, image, h, options)
-    } catch (err) {
-      lastError = err
-    }
-  }
-  throw new EngineError(`Yandex 双域名均失败: ${String(lastError)}`)
-}
-
-async function searchYandexOn(
-  http: HttpClient,
-  image: Buffer,
-  host: string,
-  options: { timeout?: number; proxy?: string },
-): Promise<{ resultUrl: string; candidates: PostCandidate[] }> {
-  const uploadResp = await http.postFile(
-    `https://${host}/images/search`,
-    'upfile',
-    image,
-    {
-      timeout: options.timeout,
-      proxy: options.proxy,
-      filename: 'blob',
-      contentType: 'image/jpeg',
-      query: {
-        rpt: 'imageview',
-        format: 'json',
-        request: YANDEX_UPLOAD_REQUEST,
-      },
-    },
-  )
-  if (!uploadResp.ok) throw new EngineError(`HTTP ${uploadResp.status}`)
-  const uploadData: any = await uploadResp.json()
-  const blocks = uploadData?.blocks || []
-  const params = blocks[0]?.params || {}
-  const cbirId = params.cbirId
-  const originalUrl = params.originalImageUrl || ''
-  if (!cbirId) throw new EngineError('上传响应中未找到 cbirId')
-
-  const resultUrl =
-    `https://${host}/images/search?rpt=imageview&cbir_page=similar&cbir_id=` +
-    quoteKeepUrlChars(`url=${originalUrl}&cbir_id=${cbirId}`)
-
-  const html = await http.getText(resultUrl, {
-    timeout: options.timeout,
-    proxy: options.proxy,
-  })
-
-  // 验证页 ≠ 无结果：HTTP 200 也可能只是验证页，必须区分失败语义
-  if (
-    !html.includes('cbirSites') &&
-    /ShowCaptcha|captcha-redirect|Captcha/i.test(html)
-  ) {
-    throw new EngineError(`${host} 返回验证页（搜索未交付，非无结果）`)
-  }
-
-  return { resultUrl, candidates: parseYandexHtml(html) }
-}
-
-export function parseYandexHtml(html: string): PostCandidate[] {
-  const txt = html
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, '&')
-  const marker = '"cbirSites":{"sites"'
-  const i = txt.indexOf(marker)
-  if (i === -1) return []
-  const j = txt.indexOf('[', i)
-  if (j === -1) return []
-
-  let depth = 0
-  let end = -1
-  for (let k = j; k < txt.length; k++) {
-    const c = txt[k]
-    if (c === '[') depth++
-    else if (c === ']') {
-      depth--
-      if (depth === 0) {
-        end = k
-        break
-      }
-    }
-  }
-  if (end === -1) return []
-
-  let rawList: any[]
-  try {
-    rawList = JSON.parse(txt.slice(j, end + 1))
-  } catch {
-    return []
-  }
-
-  const out: PostCandidate[] = []
-  const seen = new Set<string>()
-  for (const item of rawList) {
-    let pageUrl = String(item?.url || '').replace(
-      /[?&]utm_medium=organic(&|%26|&amp;)?utm_source=yandexsmartcamera.*$/,
-      '',
-    )
-    pageUrl = pageUrl.replace(/[?&]+$/, '')
-    if (!pageUrl || seen.has(pageUrl)) continue
-    seen.add(pageUrl)
-    const orig = item?.originalImage || {}
-    const thumb = item?.thumb || {}
-    out.push({
-      engine: 'yandex',
-      pageUrl,
-      title: item?.title || '',
-      description: item?.description || '',
-      imageUrl: orig?.url || thumb?.url || '',
-    })
-  }
-  return out
-}
-
-// ---------------------------------------------------------------------------
-// SauceNAO：官方 API，直接返回作者与原帖 URL（X status / Pixiv artwork）
-// ---------------------------------------------------------------------------
-
-/** multipart 上传用的媒体类型与文件名，按实际文件头决定。 */
-function uploadMeta(data: Buffer): { mime: string; filename: string } {
-  const fmt = imageFormat(data)
-  if (fmt === 'png') return { mime: 'image/png', filename: 'image.png' }
-  if (fmt === 'webp') return { mime: 'image/webp', filename: 'image.webp' }
-  return { mime: 'image/jpeg', filename: 'image.jpg' }
-}
-
-export async function searchSaucenao(
-  http: HttpClient,
-  image: Buffer | string,
-  options: { apiKey: string; timeout?: number; proxy?: string },
-): Promise<PostCandidate[]> {
-  if (!options.apiKey) {
-    throw new EngineError('SauceNAO 需要 api_key（saucenao.com 免费注册，100 次/天）')
-  }
-  // 本地字节直传（multipart file），不依赖任何第三方图床；
-  // 传 URL 时走 SauceNAO 的 url 参数（保留给已有外链的场景）。
-  let data: any
-  if (Buffer.isBuffer(image)) {
-    const meta = uploadMeta(image)
-    const resp = await http.postFile('https://saucenao.com/search.php', 'file', image, {
-      timeout: options.timeout,
-      proxy: options.proxy,
-      filename: meta.filename,
-      contentType: meta.mime,
-      extraFields: {
-        db: '999',
-        output_type: '2',
-        numres: '16',
-        api_key: options.apiKey,
-      },
-    })
-    const text = await resp.text()
-    try {
-      data = JSON.parse(text)
-    } catch {
-      throw new EngineError(`SauceNAO 响应异常(HTTP ${resp.status}): ${text.slice(0, 120)}`)
-    }
-    // SauceNAO 对无效 key 返回 HTTP 403 + header.message，优先展示原因
-    const header = data?.header || {}
-    if (header.status !== undefined && Number(header.status) !== 0) {
-      throw new EngineError(
-        `SauceNAO: ${header.message || `status=${header.status}`}`,
-      )
-    }
-  } else {
-    data = await http.getJson('https://saucenao.com/search.php', {
-      timeout: options.timeout,
-      proxy: options.proxy,
-      query: {
-        db: 999,
-        output_type: 2,
-        numres: 16,
-        api_key: options.apiKey,
-        url: image,
-      },
-    })
-  }
-
-  const status = data?.header?.status
-  if (status !== undefined && status !== null && Number(status) !== 0) {
-    throw new EngineError(`SauceNAO status=${status}`)
-  }
-
-  const out: PostCandidate[] = []
-  for (const result of data?.results || []) {
-    const d = result?.data || {}
-    const extUrls: string[] = d.ext_urls || []
-    const handle: string =
-      d.twitter_user_handle || d.author_name || d.member_name || ''
-    let platform = ''
-    let postUrl = ''
-    for (const u of extUrls) {
-      if (u.includes('twitter.com') || u.includes('x.com')) {
-        platform = 'X/Twitter'
-        postUrl = u
-        break
-      }
-      if (u.includes('pixiv.net')) {
-        platform = 'Pixiv'
-        postUrl = u
-      }
-    }
-    if (!platform && extUrls.length) postUrl = extUrls[0]
-    out.push({
-      engine: 'saucenao',
-      pageUrl: postUrl || extUrls[0] || '',
-      postUrl,
-      title: d.title || '',
-      authorHandle: String(handle).replace(/^@+/, ''),
-      authorPlatform: platform || (d.pixiv_id ? 'Pixiv' : ''),
-      weight: 0.5,
-    })
-  }
-  return out
-}
-
-// ---------------------------------------------------------------------------
-// ascii2d：无官方 API，解析彩色搜索结果页；当前被 CF 拦，支持 cf_clearance
-// ---------------------------------------------------------------------------
-
-export async function searchAscii2d(
-  http: HttpClient,
-  image: Buffer,
-  options: { timeout?: number; proxy?: string; cfClearance?: string },
-): Promise<PostCandidate[]> {
-  const headers: Record<string, string> = {}
-  if (options.cfClearance) {
-    headers.Cookie = `cf_clearance=${options.cfClearance}`
-  }
-  const resp = await http.postFile('https://ascii2d.net/search/file', 'file', image, {
-    timeout: options.timeout,
-    proxy: options.proxy,
-    headers,
-    filename: 'blob',
-    contentType: 'image/jpeg',
-  })
-  const text = await resp.text()
-  if (resp.status === 403 || text.slice(0, 2000).includes('Just a moment')) {
-    throw new EngineError(
-      'ascii2d 被 Cloudflare 拦截：可在配置中提供有效的 cf_clearance cookie',
-    )
-  }
-  if (!resp.ok) throw new EngineError(`HTTP ${resp.status}`)
-
-  const out: PostCandidate[] = []
-  const seen = new Set<string>()
-  const blockRe = /<div class="detail-box[^"]*"[^>]*>([\s\S]*?)<\/div>/g
-  let m: RegExpExecArray | null
-  while ((m = blockRe.exec(text))) {
-    const block = m[1]
-    const linkMatch = block.match(/href="(https?:\/\/[^"]+)"[^>]*>/)
-    if (!linkMatch) continue
-    const url = linkMatch[1]
-    if (seen.has(url) || url.includes('ascii2d')) continue
-    seen.add(url)
-
-    let handle = ''
-    let platform = ''
-    const um = url.match(/(?:twitter|x)\.com\/@?(\w{2,20})(?:\/status\/(\d+))?/)
-    if (um) {
-      handle = um[1]
-      platform = 'X/Twitter'
-    } else {
-      const pm = url.match(/pixiv\.net\/(?:artworks\/\d+|users\/(\d+))/)
-      if (pm) {
-        handle = pm[1] || ''
-        platform = 'Pixiv'
-      }
-    }
-    const titleMatch = block.match(/<h4[^>]*>([\s\S]*?)<\/h4>/)
-    out.push({
-      engine: 'ascii2d',
-      pageUrl: url,
-      postUrl:
-        url.includes('/status/') || url.includes('artworks/') ? url : '',
-      title: titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : '',
-      authorHandle: handle,
-      authorPlatform: platform,
-      weight: 0.4,
-    })
-  }
-  return out
-}
-
-// ---------------------------------------------------------------------------
-// Google Cloud Vision WEB_DETECTION（官方付费）
-// ---------------------------------------------------------------------------
-
-export async function searchGcv(
-  http: HttpClient,
-  image: Buffer,
-  options: { apiKey: string; timeout?: number; proxy?: string },
-): Promise<PostCandidate[]> {
-  if (!options.apiKey) {
-    throw new EngineError('GCV 需要 GCP API key（Vision API，webDetection）')
-  }
-  const body = {
-    requests: [
-      {
-        image: { content: image.toString('base64') },
-        features: [{ type: 'WEB_DETECTION', maxResults: 20 }],
-      },
-    ],
-  }
-  const data = await http.getJson(
-    `https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(
-      options.apiKey,
-    )}`,
-    {
-      method: 'POST',
-      body: JSON.stringify(body),
-      headers: { 'Content-Type': 'application/json' },
-      timeout: options.timeout,
-      proxy: options.proxy,
-    },
-  )
-
-  const wd = data?.responses?.[0]?.webDetection || {}
-  const out: PostCandidate[] = []
-  const seen = new Set<string>()
-  const sections: Array<[string, number]> = [
-    ['pagesWithMatchingImages', 0.3],
-    ['fullMatchingImages', 0.2],
-    ['partialMatchingImages', 0.15],
-  ]
-  for (const [section, weight] of sections) {
-    for (const item of wd[section] || []) {
-      const url = item?.url || ''
-      if (!url || seen.has(url)) continue
-      seen.add(url)
-      out.push({ engine: 'gcv', pageUrl: url, weight })
-    }
-  }
-  return out
-}
-
-// ---------------------------------------------------------------------------
-// SerpApi Google Lens：exact_matches 完全匹配（官方第三方 API，付费）
-// ---------------------------------------------------------------------------
-
-export async function searchGoogleLens(
-  http: HttpClient,
-  image: Buffer | string,
-  options: {
-    apiKey: string
-    visualMatches?: boolean
-    timeout?: number
-    proxy?: string
-  },
-): Promise<PostCandidate[]> {
-  if (!options.apiKey) throw new EngineError('Google Lens 需要 serpapi_api_key')
-
-  // 本地字节 → SerpApi Image API 上传拿 image_id（独立于 Yandex 图床）。
-  // 上传限制：JPG/PNG/WebP，≤500 KB，image_id 10 分钟有效。
-  let imageId = ''
-  if (Buffer.isBuffer(image)) {
-    // SerpApi 只收 JPG/PNG/WebP 且 ≤500 KB：格式不支持或超限时强制转 JPEG
-    const fmt = imageFormat(image)
-    const allowed = fmt === 'jpeg' || fmt === 'png' || fmt === 'webp'
-    const needsConvert = !allowed || image.length > 500 * 1024
-    const payload = needsConvert
-      ? await compressToMaxBytes(image, 500 * 1024, true)
-      : image
-    const meta = uploadMeta(payload)
-    const resp = await http.postFile('https://serpapi.com/image', 'image', payload, {
-      timeout: options.timeout,
-      proxy: options.proxy,
-      filename: meta.filename,
-      contentType: meta.mime,
-      extraFields: { api_key: options.apiKey },
-    })
-    const text = await resp.text()
-    let upload: any
-    try {
-      upload = JSON.parse(text)
-    } catch {
-      upload = undefined
-    }
-    imageId = String(upload?.image_id || '')
-    if (!imageId) {
-      const reason =
-        upload?.error || upload?.message || text.slice(0, 120) || '未知错误'
-      throw new EngineError(`SerpApi 图片上传失败(HTTP ${resp.status}): ${reason}`)
-    }
-  }
-
-  const kinds: Array<[string, number]> = [['exact_matches', 0.45]]
-  if (options.visualMatches) kinds.push(['visual_matches', 0.15])
-
-  const out: PostCandidate[] = []
-  const seen = new Set<string>()
-  for (const [kind, weight] of kinds) {
-    const data: any = await http.getJson('https://serpapi.com/search.json', {
-      timeout: options.timeout,
-      proxy: options.proxy,
-      query: {
-        engine: 'google_lens',
-        type: kind,
-        ...(imageId
-          ? { image_id: imageId }
-          : { url: typeof image === 'string' ? image : '' }),
-        safe: 'off',
-        api_key: options.apiKey,
-      },
-    })
-    if (data?.error) throw new EngineError(`Google Lens: ${String(data.error).slice(0, 120)}`)
-    for (const item of data?.[kind] || []) {
-      const link = item?.link || ''
-      if (!link || seen.has(link)) continue
-      seen.add(link)
-      const source = item?.source || {}
-      const page = source?.link || link
-      if (seen.has(page)) continue
-      seen.add(page)
-      out.push({
-        engine: 'gcl',
-        pageUrl: page,
-        title: source?.name || item?.title || '',
-        imageUrl: item?.original || '',
-        weight,
-      })
-    }
-  }
-  return out
-}
-
-// ---------------------------------------------------------------------------
-// 免 Key Google Lens：直接上传图片并解析结果页
+// 鱼鱼找鸡：被引图片 → 反查来源 → 抽 coser 社媒账号 → 回一句话。
 //
-// 流程与 flj_finder 使用的 PicImageSearch 完全一致：
-//   POST lens.google.com/v3/upload (multipart encoded_image)
-//   → 上传响应里找 exact_matches 标签（udm=48）→ GET 该结果页
-//   → 解析 .YxbOwd 条目（a.ngTNl / .ZhosBf / .xuPcX）
-// Google 在部分出口 IP 上会返回“需要启用 JavaScript”的验证页，这时明确报错，
-// 不把它当成“没有结果”。
-// ---------------------------------------------------------------------------
+// 设计要点（都是踩过才知道的）：
+//   · 引擎能力差别极大：SauceNAO 是唯一「无 key、纯 HTTP、直连可达」的，其余
+//     直连接口全是空壳或被拒，必须真浏览器跑 DOM。
+//   · 浏览器一次只跑一个任务（FishBrowser 里有全局 FIFO 锁）。
+//   · 出站请求一律走 safeFetch（防 SSRF）或白名单里的固定 POST。绝不把用户图片
+//     发到白名单外的域名。
+//   · 这个模块零 token：不碰任何大模型。
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { validateFetchUrl } from './safe-fetch'
+import { matchPlatform, socialNameFromTitle } from './accounts'
+import type { Candidate, Failure } from './accounts'
+import { absUrl, hostOf, sleep, stripTags, trimText } from './utils'
+import { BROWSER_UA } from './constants'
+import { fileUploadHtml, resolveLensGoto, visit } from './browser'
+import type { BrowserTab, FishBrowser } from './browser'
 
-const LENS_HEADERS = { 'Accept-Language': 'en-US,en;q=0.9' }
+export { UPLOAD_HOSTS, hostAllowed, BROWSER_UA, BROWSER_UA_CHROME } from './constants'
 
-function lensHasClass(el: any, name: string): boolean {
-  const cls = DomUtils.getAttributeValue(el, 'class') || ''
-  return cls.split(/\s+/).includes(name)
+export const ENGINE_IDS = ['saucenao', 'lens', 'baidu', 'iqdb', 'tracemoe'] as const
+export type EngineId = typeof ENGINE_IDS[number]
+
+// ── Google Lens ───────────────────────────────────────────────────────────
+// 移植自 koishi-plugin-imgsearch-coser（WhiteBr1ck）的核心思路：找 coser 最准的一条路是
+// Google Lens 反查图片，结果里往往直接是原帖（x.com/xxx/status/…）。
+// 它没有公开 JSON 接口，只有 lens.google.com/v3/upload 这个「POST 图片 → 302 到结果页」的网页接口。
+// fetch 会踩 CORS，所以这里用真浏览器在页面里造一个 form 去 POST：浏览器天然走系统代理（魔法在线时
+// 才通），也天然带着谷歌自己的 cookie。
+export const LENS_EXTRACT = `(() => {
+  const isGoogle = (host) => /(^|\\.)google\\.[a-z.]+$/i.test(host);
+  const isAsset = (host) => /(^|\\.)(gstatic|googleusercontent)\\.com$/i.test(host);
+  const cleanTitle = (node) => {
+    const heading = node.querySelector('h1,h2,h3,[role=heading]');
+    const text = String(
+      (heading && heading.textContent) ||
+      node.getAttribute('aria-label') ||
+      node.textContent || ''
+    ).replace(/\\s+/g, ' ').trim();
+    return text.slice(0, 200);
+  };
+  const rows = [];
+  const cards = [];
+  const seen = new Set();
+  for (const a of document.querySelectorAll('a[href]')) {
+    if (a.closest('header, footer, nav, [role=navigation]')) continue;
+    const raw = a.getAttribute('href') || '';
+    let u;
+    try { u = new URL(raw, location.href); } catch (e) { continue; }
+    if (u.protocol !== 'https:') continue;
+    const title = cleanTitle(a);
+    if (!title) continue;
+    // 谷歌视觉搜索的结果卡片全是 /goto?url=<不透明 token>：真实域名只有浏览器自己知道，
+    // 交给外面用 CDP 请求拦截去解（页面里 fetch 会吃 CORS）。
+    if (isGoogle(u.hostname) && u.pathname === '/goto' && u.searchParams.get('url')) {
+      if (cards.length < 24) cards.push({ wrapper: u.href, title });
+      continue;
+    }
+    if (isGoogle(u.hostname) || isAsset(u.hostname)) {
+      const wrapped = u.searchParams.get('url') || u.searchParams.get('q') || '';
+      if (!/^https?:\\/\\//.test(wrapped) || seen.has(wrapped)) continue;
+      seen.add(wrapped);
+      rows.push({ url: wrapped, title });
+      continue;
+    }
+    if (seen.has(u.href)) continue;
+    seen.add(u.href);
+    rows.push({ url: u.href, title });
+  }
+  const bodyText = document.body ? document.body.innerText.slice(0, 4000) : '';
+  return JSON.stringify({
+    url: location.href,
+    count: rows.length,
+    cards: cards,
+    results: rows,
+    captcha: /unusual traffic|our systems have detected/i.test(bodyText) || /\\/sorry\\//.test(location.href),
+    empty: /No matches|No results|找不到相符|没有找到|未找到/i.test(bodyText)
+  });
+})()`
+
+// 只有这几类卡片值得多花时间解域名：真人 coser 的号基本只在社交平台上。
+export const LENS_SOCIAL_RE = /^(x|twitter|推特|instagram|ig|ins|微博|weibo|bilibili|哔哩|tiktok|抖音|facebook|fb|threads|xiaohongshu|小红书)/i
+// 已经解出真实域名时用它判断「这条是不是社交站点」，比看标题更可靠
+export const LENS_SOCIAL_HOST_RE = /^https?:\/\/(?:www\.|m\.)?(?:x|twitter|instagram|weibo|bilibili|tiktok|facebook|threads|xiaohongshu)\.(?:com|net)\//i
+
+interface LensOptions {
+  hl?: string
+  timeoutMs?: number
+  tempDir?: string
+  exactPass?: boolean
 }
 
-function lensFind(nodes: any[], test: (el: any) => boolean): any {
-  return DomUtils.findOne(test, nodes, true)
-}
-
-function lensText(el: any): string {
-  if (!el) return ''
-  return String(DomUtils.textContent(el) || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-/** 从内联脚本里提取 google.ldi 图片映射（Google 用 data-iid 引用）。 */
-function extractLensImageMap(html: string): Map<string, string> {
-  const map = new Map<string, string>()
-  const m = html.match(/google\.ldi\s*=\s*(\{[^}]+\})/)
-  if (!m) return map
+export async function googleLensSearch(browser: FishBrowser, bytes: Buffer, mimeType: string, { hl = 'zh-CN', timeoutMs = 45000, tempDir, exactPass = true }: LensOptions = {}): Promise<Candidate[]> {
+  if (!bytes || !bytes.length) throw new Error('没有图片')
+  const dir = tempDir || os.tmpdir()
+  const ext = /png/i.test(String(mimeType ?? '')) ? 'png' : 'jpg'
+  const file = path.join(dir, `fish-lens-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.${ext}`)
+  fs.writeFileSync(file, bytes)
+  const prepare = [
+    '(function () {',
+    "  if (document.getElementById('fishLensForm')) return 'exists';",
+    "  var form = document.createElement('form');",
+    "  form.id = 'fishLensForm'; form.method = 'POST'; form.enctype = 'multipart/form-data';",
+    "  form.action = 'https://lens.google.com/v3/upload?hl=" + hl + "';",
+    "  form.target = '_self'; form.style.display = 'none';",
+    "  var picker = document.createElement('input');",
+    "  picker.type = 'file'; picker.name = 'encoded_image'; picker.id = 'fishLensFile';",
+    '  form.appendChild(picker);',
+    "  var marker = document.createElement('input');",
+    "  marker.type = 'hidden'; marker.name = 'image_content'; marker.value = '';",
+    '  form.appendChild(marker);',
+    '  document.body.appendChild(form);',
+    "  return 'ok';",
+    '})()'
+  ].join('\n')
   try {
-    const obj = JSON.parse(
-      m[1].replace(/\\u003d/g, '=').replace(/\\u0026/g, '&'),
-    )
-    for (const [key, value] of Object.entries(obj)) {
-      if (typeof value === 'string') map.set(key, value)
+    return await browser.run(async (tab) => {
+      const out = await fileUploadHtml(tab, {
+        startUrl: 'https://www.google.com/',
+        filePath: file,
+        fileSelector: '#fishLensFile',
+        prepareExpression: prepare,
+        submitExpression: "document.getElementById('fishLensForm').submit()",
+        // 跳转到结果页之后还有一段 JS 渲染：只看 URL 会抓到一张空壳，必须等结果卡片真落地
+        waitForExpression: 'document.body && document.body.innerText.length > 400 && document.querySelectorAll("a[href]").length > 25',
+        extractExpression: LENS_EXTRACT,
+        settleMs: 2500,
+        timeoutMs: Math.max(timeoutMs, 30000)
+      })
+      let page = out?.data
+      if (typeof page === 'string') {
+        try { page = JSON.parse(page) } catch { page = {} }
+      }
+      page = page && typeof page === 'object' ? page : {}
+      if (page.captcha) throw new Error('GOOGLE_CAPTCHA：谷歌要求验证，稍后再试')
+      // 一页结果分两段解析：先拿结果卡片，再逐条解出 /goto?url= 背后的真实域名。
+      const collectFrom = async (parsed: any) => {
+        const out2 = { rows: Array.isArray(parsed?.results) ? parsed.results.slice() : [], cards: Array.isArray(parsed?.cards) ? parsed.cards : [] }
+        if (!out2.cards.length) return out2.rows
+        // 社交卡片优先解：它们最可能就是原帖/作者；解够 6 条就停，别把时间花在文章页上
+        const social = out2.cards.filter((card: any) => LENS_SOCIAL_RE.test(String(card.title ?? '')))
+        const queue = social.concat(out2.cards.filter((card: any) => !LENS_SOCIAL_RE.test(String(card.title ?? '')))).slice(0, 6)
+        for (const card of queue) {
+          const target = await resolveLensGoto(tab, String(card.wrapper ?? ''), { timeoutMs: 12000 })
+          if (!target) continue
+          if (out2.rows.some((row: any) => String(row?.url ?? '') === target)) continue
+          const cardTitle = String(card.title ?? '').slice(0, 200)
+          out2.rows.push({ url: target, title: cardTitle, authorName: socialNameFromTitle(cardTitle) })
+        }
+        return out2.rows
+      }
+      const visualRows = await collectFrom(page)
+      const looksSocial = (list: any[]) => list.some((row) => LENS_SOCIAL_RE.test(String(row?.title ?? '')) || LENS_SOCIAL_HOST_RE.test(String(row?.url ?? '')))
+      // 「完全匹配」= 同一张图在网上的原出处，通常直接就是原帖；外观相似则只是长得像。
+      // 外观那页已经捞到社交账号就不再跑第二趟（省 5 秒），否则补一趟。
+      let exactRows: any[] = []
+      if (exactPass !== false && !looksSocial(visualRows)) {
+        const exactUrl = (() => {
+          try {
+            const u = new URL(String(out?.url ?? ''))
+            if (!/^https:\/\/www\.google\.[a-z.]+\/search/i.test(u.href)) return ''
+            u.searchParams.set('udm', '48')
+            return u.href
+          } catch { return '' }
+        })()
+        if (exactUrl) {
+          try {
+            const visited = await visit(tab, {
+              url: exactUrl,
+              waitForExpression: 'document.body && document.querySelectorAll("a[href]").length > 20',
+              extractExpression: LENS_EXTRACT,
+              settleMs: 2200,
+              timeoutMs: Math.max(timeoutMs, 30000)
+            })
+            let exactPage = visited?.data
+            if (typeof exactPage === 'string') {
+              try { exactPage = JSON.parse(exactPage) } catch { exactPage = {} }
+            }
+            if (exactPage && !exactPage.captcha) {
+              exactRows = (await collectFrom(exactPage)).map((row: any) => ({ ...row, exact: true }))
+            }
+          } catch { /* 完全匹配这趟失败不影响主结果，视觉结果已经在手上 */ }
+        }
+      }
+      const rows = exactRows.concat(visualRows)
+      return rows
+        .filter((row) => row && typeof row.url === 'string')
+        .map((row) => ({ url: row.url, title: String(row.title ?? '').slice(0, 200), similarity: null, sourceUrl: row.url }))
+    })
+  } catch (error) {
+    const message = String((error as Error)?.message ?? '')
+    if (/ERR_CONNECTION|ERR_NAME_NOT_RESOLVED|ERR_TUNNEL|ERR_PROXY|ERR_TIMED_OUT/i.test(message)) {
+      throw new Error('GOOGLE_UNREACHABLE：谷歌连不上（猫猫云没开或系统代理没开）')
     }
-  } catch {
-    // 脚本不是严格 JSON 时放弃图片映射，不影响页面/标题解析
+    throw error
+  } finally {
+    try { fs.rmSync(file, { force: true }) } catch {}
   }
-  return map
 }
 
-function lensImageUrl(img: any, map: Map<string, string>): string {
-  const iid =
-    DomUtils.getAttributeValue(img, 'data-iid') ||
-    DomUtils.getAttributeValue(img, 'id') ||
-    ''
-  const mapped = iid ? map.get(iid) : ''
-  if (mapped) return mapped
-  const raw =
-    DomUtils.getAttributeValue(img, 'data-src') ||
-    DomUtils.getAttributeValue(img, 'src') ||
-    ''
-  return /^https?:\/\//i.test(raw) ? raw : ''
-}
-
-/** 把 Google 的跳转链接还原成目标页；站内链接直接丢弃。 */
-function unwrapLensUrl(href: string): string {
-  if (!href) return ''
-  if (href.startsWith('/url?')) {
-    try {
-      const q = new URL(href, 'https://www.google.com').searchParams.get('q')
-      if (q && /^https?:\/\//i.test(q)) return q
-    } catch {
-      return ''
-    }
-  }
-  return /^https?:\/\//i.test(href) ? href : ''
-}
-
-/** 找到 exact_matches 标签的链接（udm=48）。 */
-export function findLensExactHref(html: string): string {
-  const doc = parseDocument(html)
-  const anchor = lensFind(doc.children as any[], (el: any) => {
-    if (el?.name !== 'a') return false
-    const href = DomUtils.getAttributeValue(el, 'href') || ''
-    return /[?&]udm(?:%3D|=)48(?:&|$)/i.test(href)
+// SauceNAO：multipart POST，无 key 也能出结果；连续调用会被 403 限流。
+async function saucenaoSearch(bytes: Buffer, mimeType: string, { timeoutMs, onLog }: { timeoutMs: number; onLog?: (line: string) => void }): Promise<Candidate[]> {
+  const form = new FormData()
+  form.append('file', new Blob([new Uint8Array(bytes)], { type: mimeType || 'image/png' }), 'image.' + (mimeType === 'image/jpeg' ? 'jpg' : 'png'))
+  form.append('db', '999')
+  form.append('output_type', '0')
+  const url = 'https://saucenao.com/search.php'
+  await validateFetchUrl(url)
+  const response = await fetch(url, {
+    method: 'POST',
+    body: form,
+    redirect: 'follow',
+    headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html,application/xhtml+xml' },
+    signal: AbortSignal.timeout(timeoutMs)
   })
-  return anchor ? DomUtils.getAttributeValue(anchor, 'href') || '' : ''
+  if (response.status === 403) {
+    const error = new Error('SauceNAO 限流（403），至少等 60 秒再试') as Error & { code?: string }
+    error.code = 'RATE_LIMITED'
+    throw error
+  }
+  if (!response.ok) throw new Error(`SauceNAO HTTP ${response.status}`)
+  const html = await response.text()
+  return parseSaucenao(html)
 }
 
-function isLensBlockedPage(html: string): boolean {
-  if (!html) return true
-  if (/httpservice\/retry\/enablejs|enablejs\?sei=/i.test(html)) return true
-  if (/consent\.google\.com|Before you continue to Google/i.test(html)) return true
-  if (
-    !html.includes('YxbOwd') &&
-    /captcha|unusual traffic|sorry\/index/i.test(html)
-  ) {
-    return true
+export function parseSaucenao(html: string): Candidate[] {
+  const text = String(html ?? '')
+  const blocks = text.split(/<div class="result\b/).slice(1)
+  if (!blocks.length) {
+    // 有些版本用 <div id="res<index>" class="result">，退一步按 similarity 直接抓
+    const fallback: Candidate[] = []
+    const re = /resultsimilarityinfo[^>]*>\s*([\d.]+)%/g
+    let m: RegExpExecArray | null
+    while ((m = re.exec(text))) fallback.push({ similarity: Number(m[1]) / 100 })
+    return fallback
   }
-  return false
+  const candidates: Candidate[] = []
+  for (const block of blocks) {
+    const simMatch = block.match(/resultsimilarityinfo[^>]*>\s*([\d.]+)%/)
+      || block.match(/similarity-info[^>]*>[\s\S]{0,120}?([\d.]+)%/)
+      || block.match(/([\d.]+)%/)
+    const similarity = simMatch ? Number(simMatch[1]) / 100 : null
+
+    const titleMatch = block.match(/class="resulttitle"[\s\S]{0,400}?<strong[^>]*>([\s\S]*?)<\/strong>/i)
+      || block.match(/class="resulttitle"[\s\S]{0,200}?>\s*([^<]{2,200})</i)
+    const title = titleMatch ? stripTags(titleMatch[1]) : ''
+
+    // 结果里所有外链：第一个一般就是图源
+    const links: string[] = []
+    const hrefRe = /href="([^"]+)"/g
+    let hm: RegExpExecArray | null
+    while ((hm = hrefRe.exec(block))) {
+      const href = absUrl(hm[1], 'https://saucenao.com/')
+      if (!href) continue
+      const host = hostOf(href)
+      if (!host || host.endsWith('saucenao.com')) continue
+      if (!links.includes(href)) links.push(href)
+    }
+
+    // 作者行：SauceNAO 实际写的是 `Member: <a href=...>作者名</a>`（pixiv 老格式 member.php?id=），
+    // 也有 `Author:` 的写法 —— 两种都认，抓错了顶多是空，不会误认。
+    const authorMatch = block.match(/(?:Member|Author)[\s\S]{0,240}?<a\b[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i)
+      || block.match(/author[^>]*>[\s\S]{0,200}?href="([^"]+)"/i)
+    const authorUrl = authorMatch ? absUrl(authorMatch[1], 'https://saucenao.com/') : ''
+    // 作者名（如 `豊栄@ﾄﾞﾔｧ…`）：拿它去搜推特比拿作品标题搜准得多。
+    const authorName = authorMatch && authorMatch[2] ? trimText(stripTags(authorMatch[2]), 40) : ''
+
+    const snippet = trimText(stripTags(block), 200)
+    if (!links.length && !title) continue
+    candidates.push({
+      engine: 'saucenao',
+      similarity,
+      title,
+      sourceUrl: links[0] ?? '',
+      authorUrl,
+      authorName,
+      host: hostOf(links[0] ?? authorUrl),
+      snippet,
+      links
+    })
+  }
+  return candidates
 }
 
-export function parseLensExactHtml(html: string): PostCandidate[] {
-  if (isLensBlockedPage(html)) {
-    throw new EngineError(
-      'Google Lens 返回验证页/需要 JavaScript（搜索未交付，非无结果）',
-    )
+// ── IQDB：multipart POST，动漫图库（danbooru / konachan / yande.re）─────────
+export function parseIqdb(html: string): Candidate[] {
+  const text = String(html ?? '')
+  if (/Place in queue|under high load/i.test(text)) {
+    const error = new Error('IQDB 在排队（站点高负载），过一会儿再试') as Error & { code?: string }
+    error.code = 'QUEUED'
+    throw error
   }
+  if (/No relevant matches/i.test(text)) return []
+  const links: { url: string; host: string; title: string }[] = []
+  const re = /<a\b[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text))) {
+    const url = absUrl(String(m[1]).replace(/^\/\//, 'https://'), 'https://iqdb.org/')
+    if (!url) continue
+    const host = hostOf(url)
+    if (!host || host.endsWith('iqdb.org')) continue
+    if (/\.(?:css|js|ico|png|jpe?g|gif|svg)(?:\?|$)/i.test(url)) continue
+    if (links.some((item) => item.url === url)) continue
+    links.push({ url, host, title: trimText(stripTags(m[2]), 100) })
+  }
+  const sim = text.match(/(\d{1,3})%\s*similarity/i)
+  const similarity = sim ? Number(sim[1]) / 100 : null
+  return links.slice(0, 12).map((item) => ({
+    engine: 'iqdb',
+    similarity,
+    title: item.title,
+    sourceUrl: item.url,
+    authorUrl: '',
+    host: item.host,
+    snippet: '',
+    links: [item.url]
+  }))
+}
 
-  const doc = parseDocument(html)
-  const items = DomUtils.findAll(
-    (el: any) => lensHasClass(el, 'YxbOwd'),
-    doc.children as any[],
-  )
-  const imageMap = extractLensImageMap(html)
-  const out: PostCandidate[] = []
+async function iqdbSearch(bytes: Buffer, mimeType: string, { timeoutMs, onLog }: { timeoutMs: number; onLog?: (line: string) => void }): Promise<Candidate[]> {
+  const form = new FormData()
+  form.append('file', new Blob([new Uint8Array(bytes)], { type: mimeType || 'image/png' }), 'image.' + (mimeType === 'image/jpeg' ? 'jpg' : 'png'))
+  for (const n of [1, 2, 3, 4, 5, 6]) form.append('service[]', String(n))
+  const url = 'https://iqdb.org/'
+  await validateFetchUrl(url)
+  const response = await fetch(url, {
+    method: 'POST',
+    body: form,
+    redirect: 'follow',
+    headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html' },
+    signal: AbortSignal.timeout(Math.max(timeoutMs, 35000))
+  })
+  if (!response.ok) throw new Error(`IQDB HTTP ${response.status}`)
+  return parseIqdb(await response.text())
+}
+
+// ── trace.moe：动画截图反查（给的是番剧/集数，不是社媒账号）────────────────
+export function parseTracemoe(payload: any): Candidate[] {
+  const list = Array.isArray(payload?.result) ? payload.result : []
+  const out: Candidate[] = []
   const seen = new Set<string>()
-
-  for (const item of items) {
-    const anchor = lensFind([item], (el: any) => el?.name === 'a' && lensHasClass(el, 'ngTNl'))
-    const pageUrl = unwrapLensUrl(
-      anchor ? DomUtils.getAttributeValue(anchor, 'href') || '' : '',
-    )
-    if (!pageUrl || seen.has(pageUrl)) continue
-    seen.add(pageUrl)
-
-    const titleEl = lensFind([item], (el: any) => lensHasClass(el, 'ZhosBf'))
-    const siteEl = lensFind([item], (el: any) => lensHasClass(el, 'xuPcX'))
-    const img = lensFind([item], (el: any) => el?.name === 'img')
-
+  for (const item of list.slice(0, 10)) {
+    // 0.87 以下基本是「随便一个番的某帧」，真命中一般 0.9 以上 —— 低于门槛的宁可不要，
+    // 否则每次都会往结果里塞十条无关番剧。
+    const similarity = Number.isFinite(item?.similarity) ? item.similarity : 0
+    if (similarity < 0.87) continue
+    const anilistId = item?.anilist?.id ?? item?.anilist?.anime_id ?? null
+    const title = item?.anilist?.title?.native || item?.anilist?.title?.romaji || item?.anilist?.title?.english || item?.filename || ''
+    const sourceUrl = anilistId ? `https://anilist.co/anime/${anilistId}` : ''
+    if (!sourceUrl || seen.has(sourceUrl)) continue
+    seen.add(sourceUrl)
+    const episode = Number.isFinite(item?.episode) ? ` 第${item.episode}集` : ''
     out.push({
-      engine: 'lens',
-      pageUrl,
-      title: lensText(titleEl),
-      description: lensText(siteEl),
-      imageUrl: img ? lensImageUrl(img, imageMap) : '',
-      weight: 0.45,
+      engine: 'tracemoe',
+      similarity,
+      title: trimText(`${title}${episode}`, 120),
+      sourceUrl,
+      authorUrl: '',
+      host: 'anilist.co',
+      snippet: trimText(String(item?.filename ?? ''), 120),
+      links: [sourceUrl]
+    })
+    if (out.length >= 3) break
+  }
+  return out
+}
+
+async function tracemoeSearch(bytes: Buffer, mimeType: string, { timeoutMs }: { timeoutMs: number }): Promise<Candidate[]> {
+  const form = new FormData()
+  form.append('image', new Blob([new Uint8Array(bytes)], { type: mimeType || 'image/png' }), 'image.' + (mimeType === 'image/jpeg' ? 'jpg' : 'png'))
+  const url = 'https://api.trace.moe/search?anilistInfo'
+  await validateFetchUrl(url)
+  const response = await fetch(url, {
+    method: 'POST',
+    body: form,
+    headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json' },
+    signal: AbortSignal.timeout(timeoutMs)
+  })
+  if (!response.ok) throw new Error(`trace.moe HTTP ${response.status}`)
+  return parseTracemoe(await response.json())
+}
+
+// ── 百度识图（真浏览器上传）：结果是「相似图」，噪声大，只留账号主页形态的链接 ──
+export function parseBaiduGraph(html: string): Candidate[] {
+  const links = collectExternalLinks(html, {
+    base: 'https://graph.baidu.com/',
+    excludeHosts: ['baidu.com', 'bdstatic.com', 'baidupcs.com', 'bdimg.com', 'bdurl.net'],
+    cap: 60
+  })
+  const seen = new Set<string>()
+  const out: Candidate[] = []
+  for (const item of links) {
+    const hit = matchPlatform(item.url)
+    if (!hit) continue // 文章页 / 图集页一律不要，只认账号主页形态
+    const url = hit.url || item.url
+    if (seen.has(url)) continue
+    seen.add(url)
+    out.push({
+      engine: 'baidu',
+      similarity: null,
+      weak: true, // 相似图不一定同一个人，标记成弱证据
+      title: item.title,
+      sourceUrl: url,
+      authorUrl: '',
+      host: hostOf(url),
+      snippet: '',
+      links: [url]
     })
   }
   return out
 }
 
-export async function searchGoogleLensFree(
-  http: HttpClient,
-  image: Buffer,
-  options: { timeout?: number; proxy?: string } = {},
-): Promise<PostCandidate[]> {
-  const upload = await http.postFile(
-    'https://lens.google.com/v3/upload',
-    'encoded_image',
-    image,
-    {
-      timeout: options.timeout,
-      proxy: options.proxy,
-      filename: 'image.jpg',
-      contentType: 'image/jpeg',
-      headers: LENS_HEADERS,
-    },
-  )
-  if (!upload.ok) throw new EngineError(`Google Lens 上传 HTTP ${upload.status}`)
-
-  let html = await upload.text()
-
-  // exact_matches 是单独一个标签页，需要再从上传结果页跳到 udm=48
-  const exactHref = findLensExactHref(html)
-  if (exactHref) {
-    html = await http.getText(new URL(exactHref, 'https://www.google.com').toString(), {
-      timeout: options.timeout,
-      proxy: options.proxy,
-      headers: LENS_HEADERS,
+// 三家浏览器引擎的 DOM 都是「一堆外链卡片」，结构天天变，所以统一退到最稳的做法：
+// 抓所有外链、去重、排除引擎自家域名，锚文本能取到就取（取不到不影响账号抽取）。
+function collectExternalLinks(html: string, { base, excludeHosts = [], cap = 24 }: { base: string; excludeHosts?: string[]; cap?: number }): { url: string; host: string; title: string }[] {
+  const text = String(html ?? '')
+  const out: { url: string; host: string; title: string }[] = []
+  const seen = new Set<string>()
+  const anchorRe = /<a\b[^>]*?href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi
+  const push = (href: string, label: string) => {
+    const url = absUrl(href, base)
+    const host = hostOf(url)
+    if (!url || !host) return
+    if (excludeHosts.some((bad) => host === bad || host.endsWith('.' + bad))) return
+    if (seen.has(url)) return
+    seen.add(url)
+    out.push({
+      url,
+      host,
+      title: label ? trimText(stripTags(label), 120) : ''
     })
   }
+  let m: RegExpExecArray | null
+  while ((m = anchorRe.exec(text))) {
+    push(m[1], m[2])
+    if (out.length >= cap * 3) break
+  }
+  // 兜底：还有没被锚点包住的链接（JS 里拼的、property 里的）
+  if (out.length < cap) {
+    const hrefRe = /href="(https?:\/\/[^"]+)"/gi
+    while ((m = hrefRe.exec(text))) {
+      push(m[1], '')
+      if (out.length >= cap * 3) break
+    }
+  }
+  return out.slice(0, cap)
+}
 
-  return parseLensExactHtml(html)
+export interface ReverseSearchResult {
+  candidates: Candidate[]
+  failures: Failure[]
+  enginesUsed: string[]
+}
+
+/**
+ * 反查一张图。引擎选择由调用方从配置读出后传进来。
+ * 单个引擎失败不影响其它引擎；全失败返回 failures 说明原因。
+ */
+export async function reverseSearch(bytes: Buffer, mimeType: string, { engines, timeoutMs = 25000, onLog, browser, tempDir }: {
+  engines?: string[]
+  timeoutMs?: number
+  onLog?: (line: string) => void
+  browser?: FishBrowser
+  tempDir?: string
+} = {}): Promise<ReverseSearchResult> {
+  const list = (Array.isArray(engines) && engines.length ? engines : ['saucenao'])
+    .filter((id) => (ENGINE_IDS as readonly string[]).includes(id))
+  const candidates: Candidate[] = []
+  const failures: Failure[] = []
+  const enginesUsed: string[] = []
+
+  const runEngine = async (engine: string): Promise<Candidate[]> => {
+    if (engine === 'saucenao') return saucenaoSearch(bytes, mimeType, { timeoutMs, onLog })
+    if (engine === 'iqdb') return iqdbSearch(bytes, mimeType, { timeoutMs, onLog })
+    if (engine === 'tracemoe') return tracemoeSearch(bytes, mimeType, { timeoutMs })
+    if (engine === 'lens') {
+      return googleLensSearch(browser!, bytes, mimeType, { timeoutMs: Math.max(timeoutMs, 30000), tempDir })
+    }
+    if (engine === 'baidu') {
+      const dir = tempDir || os.tmpdir()
+      const file = path.join(dir, `fish-find-upload-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.${mimeType === 'image/png' ? 'png' : 'jpg'}`)
+      fs.writeFileSync(file, bytes)
+      try {
+        const { html } = await browser!.run((tab: BrowserTab) => fileUploadHtml(tab, {
+          startUrl: 'https://graph.baidu.com/pcpage/index?tpl_from=pc',
+          filePath: file,
+          fileSelector: 'input[type=file].general-upload-file',
+          settleMs: 2500,
+          timeoutMs: Math.max(timeoutMs, 30000),
+          waitForExpression: '(() => (document.querySelectorAll(\'a[href^="http"]\').length > 12 && document.body.innerText.length > 600))()'
+        }))
+        return parseBaiduGraph(html)
+      } finally {
+        try { fs.rmSync(file, { force: true }) } catch {}
+      }
+    }
+    throw new Error('未实现的引擎')
+  }
+
+  const record = async (engine: string, task: () => Promise<Candidate[]>) => {
+    const started = Date.now()
+    try {
+      const found = await task()
+      enginesUsed.push(engine)
+      if (Array.isArray(found) && found.length) {
+        for (const item of found) candidates.push({ ...item, engine })
+      } else {
+        failures.push({ engine, reason: '空结果' })
+      }
+      if (onLog) onLog(`[鱼鱼找鸡] ${engine} 完成 ${Date.now() - started}ms，结果 ${Array.isArray(found) ? found.length : 0} 条`)
+    } catch (error) {
+      const reason = String((error as Error)?.message ?? error)
+      failures.push({ engine, reason })
+      if (onLog) onLog(`[鱼鱼找鸡] ${engine} 失败 ${Date.now() - started}ms：${reason}`)
+    }
+  }
+
+  // 纯网络的三个引擎并发跑（互不影响），浏览器那台独占一个 page，必须串行。
+  const NETWORK = new Set(['saucenao', 'iqdb', 'tracemoe'])
+  const parallel = list.filter((engine) => NETWORK.has(engine))
+  const serial = list.filter((engine) => !NETWORK.has(engine))
+  await Promise.all(parallel.map((engine) => record(engine, () => runEngine(engine))))
+  for (const engine of serial) {
+    await record(engine, () => runEngine(engine))
+    if (failures.some((item) => item.engine === engine && /RATE_LIMITED|403/i.test(item.reason))) await sleep(1200)
+  }
+  return { candidates, failures, enginesUsed }
 }

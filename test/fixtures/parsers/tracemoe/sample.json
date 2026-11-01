@@ -1,0 +1,10 @@
+{
+  "result": [
+    { "similarity": 0.95, "anilist": { "id": 123, "title": { "native": "某番剧", "romaji": "Romaji", "english": "English" } }, "episode": 3, "filename": "ep3.mkv" },
+    { "similarity": 0.86, "anilist": { "id": 999, "title": { "native": "低分番" } }, "episode": 1, "filename": "low.mkv" },
+    { "similarity": 0.91, "anilist": { "id": 123, "title": { "native": "某番剧" } }, "episode": 3, "filename": "dup.mkv" },
+    { "similarity": 0.9, "episode": 5, "filename": "noanilist.mkv" },
+    { "similarity": 0.88, "anilist": { "anime_id": 456, "title": { "romaji": "Another Show" } }, "episode": null, "filename": "ep5.mkv" },
+    { "similarity": 0.92, "anilist": { "id": 789, "title": { "english": "Third Show" } }, "episode": 12, "filename": "ep12.mkv" }
+  ]
+}

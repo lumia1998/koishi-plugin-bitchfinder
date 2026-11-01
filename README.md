@@ -1,217 +1,93 @@
-# koishi-plugin-bitchfinder
+# koishi-plugin-bitchfinder（鱼鱼找鸡）
 
-多引擎图片反向检索，定位一张图片**最可能的原始出处与作者账号**。
-发送（或回复）一张图片并输入 `找鸡` / `kfc`，插件会并发调用多个反搜引擎，
-按证据强度给出作者候选、原帖链接与置信度。
+给一张图，反查这人是哪个 coser、账号在哪。
 
-> **本项目移植自 [vmoranv/astrbot_plugin_bitchfinder](https://github.com/vmoranv/astrbot_plugin_bitchfinder)**
-> （AstrBot 插件，作者 [vmoranv](https://github.com/vmoranv)）。
-> 本仓库是该插件的 Koishi / TypeScript 移植版本，并额外注册了 ChatLuna 工具 `findbitch`。
-> 原项目与本项目均以 **AGPL-3.0** 协议发布，详见 [LICENSE](./LICENSE)。
+- 多引擎：**谷歌 Lens**（最准，能抓到推特主页）、SauceNAO（动漫/同人）、trace.moe（动漫截屏）、IQDB、百度识图。
+- 零 token：不调用任何大模型，**不花 API 钱**。
+- 忠实移植自 **鱼鱼找鸡 v1.0.0**（小鲸鱼，MIT），核心算法、阈值、文案与原版一致。
 
-## 特性
+## 依赖
 
-- **多引擎并发、彼此独立**：Yandex、Google Lens（免 Key，开箱即用）、ASCII2D、SauceNAO、
-  Google Cloud Vision、Google Lens (SerpApi)。每个引擎直接上传图片字节，
-  **不依赖 Yandex 是否成功、也不依赖第三方图床**；任一引擎被拦不影响其余引擎。
-- **开箱即用**：不配置任何 Key 也能工作——Yandex + 免 Key Google Lens + ascii2d 默认启用；
-  配置 SauceNAO / SerpApi 后可进一步提升原帖命中率。
-- **证据融合而非"投票"**：正文署名、官方索引作者、跨站一致署名、感知哈希同图确认分别计分，
-  转发者不会被误判为原作者。
-- **跨站一致署名**：同一个账号名在多个独立域名页面的标题/摘要里反复出现时，
-  按独立站点数加权（+0.10 ~ +0.45）——这是聚合站场景下最有效的开箱即用线索。
-- **X 资料页核实**：用 fxTwitter 公开接口确认候选 handle 真实存在，并用显示昵称
-  与出处页文字交叉核对；昵称一致时加分，也可把"站内人名"升级为确切的 X 账号。
-- **感知哈希硬确认**：aHash + dHash（64 位）校验候选页面中的图片是否与查询图同图，
-  为跨站一致证据加权。
-- **X 账号粉丝数 tie-break**：最优先两名候选置信度并列且都是 X 账号时，取粉丝数更多者
-  （通过 fxTwitter 公开接口，无需 key）。
-- **LLM 文字线索兜底**（可选）：无可靠署名时，让 ChatLuna 模型从来源页文字中提取账号候选；
-  模型输出必须带来源原文子串，由程序逐条校验，不采信无证据的猜测。
-- **不内置 LLM 配置**：模型与 API Key 完全由 `koishi-plugin-chatluna` 管理。
+| 需要 | 说明 |
+|---|---|
+| `koishi-plugin-puppeteer`（必装） | Lens / 百度识图要在真浏览器里跑，用的是它的浏览器实例。**需要在它的 `args` 里加 `--disable-blink-features=AutomationControlled`**（实测不加时 Lens 3/3 被谷歌验证码拦，加了 3/3 通过；对其他用 puppeteer 的插件无副作用） |
+| 能访问谷歌 | 只用 SauceNAO / trace.moe / IQDB 的话国内直连即可；要用 Lens，要么系统能连谷歌，要么在插件配置里填 `proxy`，要么给 puppeteer 插件的启动参数加 `--proxy-server=…` |
+| `koishi-plugin-chatluna`（可选） | 装了会自动注册工具 `findbitch`，让模型按需反查 |
 
-## 安装
+## 用法
 
-```bash
-npm install koishi-plugin-bitchfinder
-# 或在 Koishi 控制台插件市场搜索 bitchfinder
-```
-
-若要使用 LLM 兜底或工具调用，还需安装并配置：
-
-```bash
-npm install koishi-plugin-chatluna
-```
-
-`koishi-plugin-chatluna` 是可选依赖；未安装时插件仍可正常使用 `找鸡` 命令，
-只是不会注册 `findbitch` 工具、也不会进行 LLM 文字兜底。
-
-## 使用
-
-### 聊天命令
+**引用一张图**，发 `找鸡`（或直接带图发 `找鸡`，也可以 `找鸡 <图片网址>`）。它先回「收到，开始找鸡」，再回结果：
 
 ```
-找鸡            # 附带图片发送
-kfc             # 别名
+🎯 鱼鱼找鸡结果
+
+🌐 平台：Twitter
+👤 名字：阿薰kaOri
+🆔 账号：@izayoill · https://x.com/izayoill
 ```
 
-也可以**引用（回复）一张图片**后发送命令。命令会先返回"正在多引擎检索，请稍候…"，
-随后输出：
+## 配置
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `engines` | `lens, saucenao, tracemoe` | 用哪些引擎。Lens 和百度走 puppeteer 浏览器，其余直接 HTTP |
+| `timeoutMs` | `45000` | 单个引擎的超时（Lens/百度至少按 30 秒算） |
+| `maxAccounts` | `3` | 最多报几个账号 |
+| `strictConsensus` | `true` | 开 = 名字对不上的别人的号不报（少报不错报）；关 = 全都报出来自己挑 |
+| `proxy` | 空 | 只让本插件的浏览器页面走这个代理（例如 `http://127.0.0.1:7890`）。留空 = 跟随 puppeteer 插件（它会自动使用 Koishi 全局代理） |
+| `foundImage` | 空 | 查到账号时顺带发的图（本机文件路径，相对路径按 Koishi 根目录算）。留空 = 不发图 |
+| `cooldownSec` | `30` | 同一个人在同一个会话里的冷却秒数（反查引擎有免费额度，刷爆了大家都不能用）。`0` = 不限 |
+| `registerTool` | `true` | 装了 ChatLuna 时注册工具 `findbitch`，让模型按需反查 |
+
+## 它是怎么认的（也是「为什么有时候查不到」的原因）
+
+1. 各引擎返回「相似图的所在页面」；
+2. 从页面里抽社交账号（推特/微博/B站/Instagram/Pixiv…），作者页比帖子页可信；
+3. 同一角色常有好几个 coser，只留「标题里出现同一个人名」的那一撮（`strictConsensus`）；
+4. 画作平台（pixiv）上是画师的号，不是 coser 本人；只翻到 pixiv 时，回话里会明说。
+
+## 常见问题
+
+**Lens 一直没结果 / 报 `GOOGLE_UNREACHABLE`**
+谷歌连不上。要么开系统代理，要么在配置里填 `proxy`（只让浏览器页面走），要么给 puppeteer 插件的启动参数加 `--proxy-server=…`。
+
+**报 `GOOGLE_CAPTCHA`**
+先检查 puppeteer 的 `args` 里有没有 `--disable-blink-features=AutomationControlled`（见上面依赖表）——缺这一条必被拦，页面里补丁救不回来。还有的话说明谷歌要人机验证：换 `proxy` 出口，或者先用 `saucenao,tracemoe` 顶着。
+
+**SauceNAO 报 403 / 429**
+免费额度被刷完了，等一会儿（至少 60 秒），或者少查几张。
+
+**查到一堆别人的号**
+保持 `strictConsensus: true`（默认）。它是「只报标题里出现同一个名字的人」。
+
+**图片会不会被上传到网上**
+会——反查必须把图发给引擎（谷歌 Lens / SauceNAO / trace.moe / IQDB / 百度…）。上传目标写死在代码里的 `UPLOAD_HOSTS` 白名单里，不读配置，防止被配置改去奇怪的域名。不想上传就别用。
+
+## 许可证
+
+- 本插件（Koishi 移植层）AGPL-3.0，见 `LICENSE`。
+- 核心逻辑移植自 **鱼鱼找鸡 v1.0.0**（作者：小鲸鱼），按 MIT 授权使用：
 
 ```
-最优先候选：@example  [X/Twitter]
-  置信度 0.80（正文署名/官方引擎/同图确认）
-  原帖: https://x.com/example/status/1234567890
-  · SauceNAO 索引命中: ...
-  · 转发正文署名: “…credit: @example…”
+MIT License
+
+Copyright (c) 2026 小鲸鱼
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
-
-- 只有当候选具备**正文署名、官方引擎命中或同图确认**时才作为"作者候选"展示；
-  仅有标题/URL 账号的转发者会被折叠并标注低可信。
-- 若所有引擎都没有署名证据，会附上 Yandex 出处列表与完整结果页，便于人工排查。
-
-### 示例
-
-发送一张 Coser 图片（如 `sample.png`）并输入 `找鸡`，插件会返回该图的可能出处与作者账号：
-
-```
-最优先候选：@mamamia1008  [X/Twitter]
-  置信度 0.80（正文署名/官方引擎/同图确认）
-  原帖: https://x.com/mamamia1008/status/...
-  检索: https://x.com/search?q=from%3Amamamia1008
-```
-
-![示例](sample.png)
-
-![证据](evidence.png)
-
-### ChatLuna 工具 `findbitch`
-
-安装并启用 chatluna 后，插件会自动注册工具：
-
-| 项 | 值 |
-| --- | --- |
-| 工具名 | `findbitch` |
-| 参数 | `image_url`（可选）：图片 URL / `base64://` 数据 |
-| 图片来源 | 优先 `image_url`，否则取当前消息或引用消息中的图片 |
-| 返回 | 与命令相同的排序文本 |
-
-当用户发送图片并问"这是谁 / 出自哪里 / 帮我找原图"时，模型会自行调用该工具。
-**插件不包含任何模型、Provider 或 API Key 配置**——请在 chatluna 插件中配置好模型，
-再到本插件配置项里选择用于 LLM 兜底的 `model` 即可。
-
-## 配置项
-
-### 基础设置
-
-| 配置 | 默认值 | 说明 |
-| --- | --- | --- |
-| `maxResults` | `8` | 输出的候选/出处数量上限 |
-| `timeout` | `20` | 单引擎请求超时（秒） |
-| `proxy` | 空 | HTTP 代理，如 `http://127.0.0.1:7890`；留空直连 |
-| `sendAsForward` | `true` | 以合并转发发送结果（`figure` 元素，OneBot / Red 适配器实测可用；发送失败或适配器不支持时自动回退为普通消息） |
-
-### 搜索引擎凭据
-
-| 配置 | 说明 |
-| --- | --- |
-| `saucenaoApiKey` | SauceNAO API Key（[免费申请](https://saucenao.com/user.php?page=search-api)，100 次/天）。**强烈建议配置**，对 X / Pixiv 原帖命中率提升最大 |
-| `gcvApiKey` | Google Cloud Vision API Key（启用 `WEB_DETECTION`，付费） |
-| `serpapiApiKey` | SerpApi Key，用于 Google Lens `exact_matches`（付费）。图片经 SerpApi Image API 直传（≤500 KB，超出自动压缩），不依赖 Yandex 图床 |
-| `ascii2dMode` | ascii2d 请求模式：`default` 不携带 Cookie（与 flj_finder 一致，默认）；`cookie` 携带下方 `cf_clearance` |
-| `ascii2dCookie` | ascii2d 的 Cloudflare `cf_clearance` cookie，仅在 `cookie` 模式下使用 |
-
-### 额外引擎
-
-| 配置 | 默认值 | 说明 |
-| --- | --- | --- |
-| `keylessGoogleLens` | `true` | 免 Key Google Lens：直接上传图片解析 exact_matches 结果页，不依赖任何 Key |
-| `verifyXProfile` | `true` | 用 fxTwitter 公开资料页核实候选账号（昵称/粉丝），无需 Key；用于确认"页面署名"与 X 账号是否同一人 |
-| `serpapiVisualMatches` | `false` | Google Lens 同时查询相似图（噪声较多） |
-
-### ChatLuna / LLM
-
-| 配置 | 默认值 | 说明 |
-| --- | --- | --- |
-| `useLlmCandidates` | `true` | 无可靠署名时调用模型提取文字线索 |
-| `model` | 空 | 用于文字候选解析的 ChatLuna 模型；留空则不启用 LLM 兜底 |
-
-## 工作流程
-
-1. **预处理**：读取 EXIF 方向；符合条件（JPEG/PNG/WebP、最长边 ≤1600px、方向正常）的图片
-   保留原始字节——重新编码会改变图像内容、伤害反搜命中率；其余图片纠正方向、缩放、
-   透明区填白转 JPEG、动图取第一帧。
-2. **Yandex 首发**：上传图片并解析相似站点列表；`.com` / `.ru` 双域名互备，
-   验证页与"无结果"区分处理。它不再是其他引擎的前置条件。
-3. **其余引擎并发**：各引擎独立，任一失败只影响自身；失败原因会附在结果末尾，
-   便于区分"确实没有署名"与"引擎被风控拦截"。
-   - 免 Key Google Lens、ascii2d、Google Vision：直接使用图片字节；
-   - SauceNAO：multipart 直传（`file` 字段），不借道 Yandex 图床；
-   - SerpApi Lens：先上传到 SerpApi Image API 取 `image_id`（自动压缩到 ≤500 KB），
-     再用 `image_id` 查询，同样不依赖 Yandex。
-4. **感知哈希确认**：aHash + dHash 校验候选账号页面中的图片与查询图相似度。
-5. **融合评分**：
-   - 正文署名（sc/credit/source/via…）：每处 +0.35
-   - SauceNAO 官方索引作者：+0.45
-   - Google Lens 完全匹配到 X 原帖 / 主页：+0.30 / +0.20（免 Key 与 SerpApi 同索引，按结果页去重）
-   - ascii2d 结果作者：+0.30
-   - 跨站一致署名：出现在 1 个独立域名 +0.10，每多一个域名 +0.05，封顶 +0.45
-   - 感知哈希同图：≥0.90 且跨 ≥2 域 +0.20；单域 +0.10；0.75–0.90 +0.05
-   - 聚合站站内人名必须至少出现在 2 个独立域名的标题里，才计入跨站一致署名
-   - X 资料页确认：昵称与 ≥2 个出处页文字一致 +0.15（≥3 个 +0.20）
-6. **X 资料页核实**：对得分前列的候选查询 fxTwitter，补全显示昵称、粉丝数与主页链接；
-   昵称对得上时把"站内人名"认定为该 X 账号。
-7. **粉丝 tie-break**：置信度并列的 X 账号取粉丝数更多者。
-8. **LLM 兜底**（可选）：无强证据时让模型从来源文字中提取账号候选，逐条校验 evidence。
-9. **输出**：最优先候选 + 折叠的低可信候选 + Yandex 出处列表 + 引擎状态。
-   出处列表同样按可信度排序，并标注与强候选的关系（`含 @handle 署名` /
-   `@handle 出处站` / `提及 @handle`），无关页面排在最后。
-
-## 已知限制
-
-- 反搜引擎均依赖其网页/接口结构，**上游改版会导致解析失效**；此类问题通常表现为
-  "引擎状态"中出现解析错误，而不是误报。
-- 免 Key Google Lens 依赖解析 Google 结果页：部分出口 IP 会收到"需要启用 JavaScript"
-  的验证页（与 flj_finder 的情况一致），此时该引擎会明确报错，而不是伪报"无结果"；
-  可更换代理或配置 SerpApi 作为替代。
-- SerpApi 的上传接口限制单张 ≤500 KB，超过时插件会自动缩放/降质；
-  极端情况下压缩后的图与原图略有差异，理论上可能影响少量精确匹配。
-- ascii2d 默认按无 Cookie 方式请求，可能被 Cloudflare 拦截（默认模式下只在日志提示）；
-  需要时把 `ascii2dMode` 切到 `cookie` 并填写 `cf_clearance`。
-- 合并转发使用 Satori 的 `figure` 元素，目前实测在 OneBot / Red 适配器生效；其他适配器会回退为普通消息。
-- 粉丝数 tie-break 只用于排序，**不作为归属证明**。
-- 请自行确认使用场景合法合规；不要用本插件骚扰、定位或人肉他人。
-
-## 开发
-
-```bash
-npm install
-npm run build     # tsc → lib/
-npm run dev       # tsc -w
-```
-
-目录结构：
-
-```
-src/
-  index.ts        Koishi 插件入口、命令、ChatLuna 工具
-  search.ts       反搜编排与输出
-  engines.ts      各引擎适配
-  fuse.ts         证据融合与置信度评分
-  llm.ts          文字候选提取与校验
-  preprocess.ts   图片预处理与感知哈希
-  social.ts       fxTwitter 粉丝数查询
-  http.ts         fetch + undici 代理客户端
-  types.ts        通用类型
-```
-
-## 协议
-
-[AGPL-3.0](./LICENSE)，与原项目
-[vmoranv/astrbot_plugin_bitchfinder](https://github.com/vmoranv/astrbot_plugin_bitchfinder) 保持一致。
-
-## 致谢
-
-- 原项目：[vmoranv/astrbot_plugin_bitchfinder](https://github.com/vmoranv/astrbot_plugin_bitchfinder)
-- 免 Key Google Lens 解析流程参考：[NumInvis/astrbot_plugin_flj_finder](https://github.com/NumInvis/astrbot_plugin_flj_finder)
-- ChatLuna：[ChatLunaLab/chatluna](https://github.com/ChatLunaLab/chatluna)

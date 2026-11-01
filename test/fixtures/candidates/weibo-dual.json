@@ -1,0 +1,4 @@
+{ "candidates": [
+  { "engine": "saucenao", "similarity": 0.9, "title": "某作品", "sourceUrl": "https://example.com/post/1", "links": ["https://weibo.com/n/nick_name"] },
+  { "engine": "saucenao", "similarity": 0.85, "title": "某作品", "sourceUrl": "https://example.com/post/1", "links": ["https://weibo.com/u/123456789"] }
+] }
