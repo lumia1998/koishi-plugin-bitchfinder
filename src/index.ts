@@ -43,7 +43,7 @@ export const Config: Schema<Config> = Schema.object({
     Schema.const('tracemoe').description('trace.moe（动漫截屏溯源，直连）'),
     Schema.const('iqdb').description('IQDB（动漫图库，直连，常排队）'),
     Schema.const('baidu').description('百度识图（很慢）'),
-  ])).role('checkbox').default(['lens', 'saucenao', 'tracemoe']).description('用哪些引擎。Lens 和百度走 puppeteer 浏览器，其余直接 HTTP。'),
+  ])).role('checkbox').default(['lens']).description('用哪些引擎。Lens 和百度走 puppeteer 浏览器，其余直接 HTTP。默认只开 Lens：真人/coser 图靠它最准；SauceNAO/trace.moe/IQDB 只认动漫图，真人照片只会返回「看着像」的画作。'),
   serpapiKey: Schema.string().role('secret').default('').description('可选：SerpApi 的 Google Lens key（付费 API，免费档每月 100 次）。填了且图片有公网地址时，Lens 走 SerpApi 不依赖能连谷歌的浏览器；失败自动回退浏览器 Lens。base64/本地图没有公网地址，只能走浏览器。'),
   timeoutMs: Schema.natural().role('ms').default(45000).description('单个引擎的超时（Lens/百度至少按 30 秒算）。'),
   maxAccounts: Schema.natural().min(1).default(3).description('最多报几个账号。'),

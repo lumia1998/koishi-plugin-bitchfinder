@@ -30,7 +30,7 @@
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `engines` | `lens, saucenao, tracemoe` | 用哪些引擎。Lens 和百度走 puppeteer 浏览器，其余直接 HTTP |
+| `engines` | `lens` | 用哪些引擎。Lens 和百度走 puppeteer 浏览器，其余直接 HTTP。默认只开 Lens：真人/coser 图靠它最准；SauceNAO/trace.moe/IQDB 只认动漫图，真人照片只会返回「看着像」的画作 |
 | `serpapiKey` | 空 | 可选：SerpApi 的 Google Lens key（付费 API，免费档每月 100 次）。填了且图片有公网地址时 Lens 走 SerpApi，不依赖能连谷歌的浏览器；失败自动回退浏览器 Lens。base64/本地图没有公网地址，只能走浏览器 |
 | `timeoutMs` | `45000` | 单个引擎的超时（Lens/百度至少按 30 秒算） |
 | `maxAccounts` | `3` | 最多报几个账号 |
@@ -60,6 +60,9 @@
 
 **查到一堆别人的号**
 保持 `strictConsensus: true`（默认）。它是「只报标题里出现同一个名字的人」。
+
+**findbitch 工具报「禁止访问内网/本机地址」**
+内网/127.x/10.x URL 是有意拦的（防注入探测内网）。让模型传**本机文件路径**（如 `/tmp/x.png`）或 `base64://` 数据，不要传内网 URL。
 
 **图片会不会被上传到网上**
 会——反查必须把图发给引擎（谷歌 Lens / SauceNAO / trace.moe / IQDB / 百度…）。上传目标写死在代码里的 `UPLOAD_HOSTS` 白名单里，不读配置，防止被配置改去奇怪的域名。不想上传就别用。
