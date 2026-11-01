@@ -107,7 +107,11 @@ export async function serpapiLensSearch(imageUrl: string, { apiKey, timeoutMs = 
     })
     if (!response.ok) throw new Error(`Google Lens(SerpApi) HTTP ${response.status}（key 无效或额度耗尽）`)
     const data: any = await response.json()
-    if (data?.error) throw new Error(`Google Lens(SerpApi)：${String(data.error).slice(0, 120)}`)
+    if (data?.error) {
+      // 「没结果」也被 SerpApi 包在 error 字段里——这不是失败，是空结果
+      if (/hasn't returned any results/i.test(String(data.error))) return {}
+      throw new Error(`Google Lens(SerpApi)：${String(data.error).slice(0, 120)}`)
+    }
     return data
   }
   const seen = new Set<string>()
@@ -132,6 +136,7 @@ export async function serpapiLensSearch(imageUrl: string, { apiKey, timeoutMs = 
   if (!rows.length) {
     const visual = await fetchKind('')
     collect(visual?.visual_matches)
+    collect(visual?.organic_results)
     collect(visual?.exact_matches)
   }
   return rows.slice(0, 24)
@@ -535,8 +540,13 @@ export async function reverseSearch(bytes: Buffer, mimeType: string, { engines, 
       const key = String(serpapiKey ?? '').trim()
       if (key && lensUrl) {
         try {
-          return await serpapiLensSearch(lensUrl, { apiKey: key, timeoutMs: Math.max(timeoutMs, 30000) })
+          const rows = await serpapiLensSearch(lensUrl, { apiKey: key, timeoutMs: Math.max(timeoutMs, 30000) })
+          // 空结果可能是 SerpApi 的抓取器够不着图床（内网图链、要 referer 的站），
+          // 回退浏览器再传字节试一次 —— 宁可慢也别直接报「没查到」。
+          if (rows.length || !browser) return rows
+          onLog?.('[鱼鱼找鸡] lens(SerpApi) 空结果，回退浏览器')
         } catch (error) {
+          if (!browser) throw error
           onLog?.(`[鱼鱼找鸡] lens(SerpApi) 不可用，回退浏览器：${String((error as Error)?.message ?? error)}`)
         }
       }
