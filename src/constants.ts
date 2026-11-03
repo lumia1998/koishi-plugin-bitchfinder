@@ -5,7 +5,7 @@ import { hostOf } from './utils'
 // 2026-10-29 加：iqdb.org（动漫图库）、api.trace.moe（动画截图）。
 // ascii2d 试过但被 Cloudflare 拦（headless 永远停在「正在进行安全验证」），不列进来。
 export const UPLOAD_HOSTS = [
-  'saucenao.com', 'yandex.com', 'yandex.ru', 'bing.com', 'baidu.com', 'google.com', 'lens.google.com',
+  'saucenao.com', 'yandex.com', 'yandex.ru', 'bing.com', 'google.com', 'lens.google.com',
   'iqdb.org', 'trace.moe',
   // SerpApi 的 Google Lens API：不传图片字节，只给图片的公网 URL 让它自己抓
   'serpapi.com',

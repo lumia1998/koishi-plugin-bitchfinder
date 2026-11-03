@@ -5,9 +5,9 @@ import type {} from 'koishi-plugin-puppeteer'
 import fs from 'node:fs'
 import path from 'node:path'
 import { extractAccounts, formatReply } from './accounts'
-import type { Account } from './accounts'
+import type { Account, Candidate, Failure } from './accounts'
 import { FishBrowser } from './browser'
-import { buildNestedRankNodes, buildRankForward, formatRankText, formatReport } from './check/format'
+import { buildRankForward, formatRankText, formatReport } from './check/format'
 import type { RankGroup } from './check/format'
 import { buildRank, RANK_CATEGORIES, resolveCategory } from './check/rank'
 import { RankFetcher } from './check/remote'
@@ -18,18 +18,18 @@ import { reverseSearch } from './engines'
 import type { EngineId } from './engines'
 import { imageFromSession, imageFromUrl, sniffMime } from './image'
 import type { ImageInput } from './image'
+import { fetchXProfile } from './profile'
 import { registerFindBitchTool } from './tool'
-import { sleep } from './utils'
 
 export const name = 'bitchfinder'
 export const inject = { required: ['puppeteer'], optional: ['chatluna', 'database'] }
 
 export const usage = `根据图片和用户名找鸡和鉴别鸡：给一张图反查 coser/博主的社媒账号；给一个 X 用户名鉴定真实度和风险。
 
-需要 puppeteer 服务（谷歌 Lens / 百度识图用浏览器跑）。
+需要 puppeteer 服务（谷歌 Lens 用浏览器跑）。
 
 用法：
-· 引用一张图发「找鸡」（或带图发）
+· 引用一张图发「找鸡」（或带图发）；默认只回最像的一个，认错了引用结果回复「不对」看下一个
 · 发「鉴定 @用户名」查 X 账号可信度（需要 xAI API Key）
 · 发「烧鸡榜」看 flj.info 排行榜（连不上时用本机记录）
 
@@ -54,7 +54,6 @@ export interface Config {
   checkCooldownSec: number
   checkDailyLimit: number
   rankSize: number
-  rankNested: boolean
   rankApiBase: string
   checkHint: boolean
 }
@@ -65,11 +64,10 @@ export const Config: Schema<Config> = Schema.object({
     Schema.const('saucenao').description('SauceNAO（动漫/同人，直连，免费有频率限制）'),
     Schema.const('tracemoe').description('trace.moe（动漫截屏溯源，直连）'),
     Schema.const('iqdb').description('IQDB（动漫图库，直连，常排队）'),
-    Schema.const('baidu').description('百度识图（很慢）'),
-  ])).role('checkbox').default(['lens']).description('用哪些引擎。Lens 和百度走 puppeteer 浏览器，其余直接 HTTP。默认只开 Lens：真人/coser 图靠它最准；SauceNAO/trace.moe/IQDB 只认动漫图，真人照片只会返回「看着像」的画作。'),
+  ])).role('checkbox').default(['lens']).description('用哪些引擎。Lens 走 puppeteer 浏览器，其余直接 HTTP。默认只开 Lens：真人/coser 图靠它最准；SauceNAO/trace.moe/IQDB 只认动漫图，真人照片只会返回「看着像」的画作。'),
   serpapiKey: Schema.string().role('secret').default('').description('可选：SerpApi 的 Google Lens key（付费 API，免费档每月 100 次）。填了且图片有公网地址时，Lens 走 SerpApi 不依赖能连谷歌的浏览器；失败自动回退浏览器 Lens。base64/本地图没有公网地址，只能走浏览器。'),
-  timeoutMs: Schema.natural().role('ms').default(45000).description('单个引擎的超时（Lens/百度至少按 30 秒算）。'),
-  maxAccounts: Schema.natural().min(1).default(3).description('最多报几个账号。'),
+  timeoutMs: Schema.natural().role('ms').default(45000).description('单个引擎的超时（Lens 至少按 30 秒算）。'),
+  maxAccounts: Schema.natural().min(1).default(3).description('最多准备几个候选。默认只发最像的那一个；用户引用结果回复「不对」时再依次发后面的。'),
   strictConsensus: Schema.boolean().default(true).description('开 = 名字对不上的别人的号不报（少报不错报）；关 = 全都报出来自己挑。'),
   proxy: Schema.string().default('').description('只让本插件的浏览器页面走这个代理（例如 http://127.0.0.1:7890）。留空 = 跟随 puppeteer 插件（它会自动使用 Koishi 全局代理）。'),
   foundImage: Schema.string().default('').description('查到账号时顺带发的图（本机文件路径，相对路径按 Koishi 根目录算，比如一张「找到了」的表情包）。留空 = 不发图。'),
@@ -83,27 +81,26 @@ export const Config: Schema<Config> = Schema.object({
   checkCooldownSec: Schema.natural().default(30).description('鉴定冷却秒数（同一个人）。只对真正调用 AI 的请求生效，读缓存不受限。'),
   checkDailyLimit: Schema.natural().default(10).description('每个人每天最多鉴定几次（防止被人拿去刷你的 xAI 余额）。0 = 不限。'),
   rankSize: Schema.natural().min(1).default(5).description('烧鸡榜每个分类显示几个人。'),
-  rankNested: Schema.boolean().default(false).description('实验功能：烧鸡榜用嵌套合并转发，外层一个总合集、每个分类是一个可展开的子合集。需要 SnowLuma / NapCat 这类支持 node 套 node 的 OneBot 实现，其他实现会发送失败并自动退回平铺转发。默认关闭，直接发平铺转发。'),
   rankApiBase: Schema.string().default('https://flj.info/api/rankings').description('烧鸡榜的数据接口（flj.info 的公开排行榜）。留空 = 只用本机鉴定记录；接口连不上时会自动回退到本机记录。'),
   checkHint: Schema.boolean().default(true).description('找鸡查到 X 账号时，在结果末尾加一句「发鉴定 @用户名 查可信度」的提示。'),
 })
 
-/**
- * 转发套转发只能绕过 Koishi 的 OneBot 适配器，直接发原始 node 段：
- * 适配器会把 h('message', { forward: true }) 拆成独立消息，写不出嵌套。
- * 仅 OneBot 平台可用，其他平台返回 false 让调用方走普通转发。
- */
-async function sendNestedForward(session: Session, nodes: any[]): Promise<boolean> {
-  const bot = session.bot as any
-  if (!bot || bot.platform !== 'onebot' || !bot.internal) return false
-  const channelId = String(session.channelId ?? '')
-  if (session.isDirect) {
-    await bot.internal.sendPrivateForwardMsg(channelId.replace(/^private:/, ''), nodes)
-  } else {
-    await bot.internal.sendGroupForwardMsg(channelId, nodes)
-  }
-  return true
+/** 一次找鸡的结果：按机器人发出的消息 id 记住，用户引用那条消息说「不对」时给下一个候选。 */
+interface FindRecord {
+  accounts: Account[]
+  candidates: Candidate[]
+  enginesUsed: string[]
+  failures: Failure[]
+  shown: number
+  at: number
+  channelId: string
+  userId: string
 }
+
+/** 「不对」的各种说法。只认整句，避免「不是吧这也能找到」这种语气被误触。 */
+const DISLIKE_RE = /^(?:不对|不是|错了|认错了?|不是这个|不是他|不是她|换一个|换个人)[！!。.，,？?~～\s]*$/
+const FIND_TTL_MS = 30 * 60 * 1000
+const FIND_RECORD_LIMIT = 500
 
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('bitchfinder')
@@ -134,7 +131,13 @@ export function apply(ctx: Context, config: Config) {
   const gap = Math.max(0, Number(config.cooldownSec) || 0) * 1000
   const keyOf = (session: Session) => `${session.platform}:${session.channelId}|${session.userId}`
 
-  const findChicken = async (image: ImageInput): Promise<{ text: string; accounts: Account[] }> => {
+  const findChicken = async (image: ImageInput): Promise<{
+    text: string
+    accounts: Account[]
+    candidates: Candidate[]
+    enginesUsed: string[]
+    failures: Failure[]
+  }> => {
     const result = await reverseSearch(image.bytes, image.mimeType, {
       engines: config.engines,
       timeoutMs: config.timeoutMs,
@@ -150,7 +153,7 @@ export function apply(ctx: Context, config: Config) {
       enginesUsed: result.enginesUsed,
       failures: result.failures
     }).replace(/\*\*/g, '') // QQ 不渲染 markdown（同原版 README 的样例）
-    return { text, accounts }
+    return { text, accounts, candidates: result.candidates, enginesUsed: result.enginesUsed, failures: result.failures }
   }
 
   /** 「已找到鸡」素材：读得到、没超限才返回 Buffer，否则 null（调用方只发文字）。 */
@@ -169,8 +172,110 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
+  /** 找鸡结果只发「最准的那个」，完整候选留在内存里，等用户引用结果说「不对」再逐个给。 */
+  const findRecords = new Map<string, FindRecord>()
+
+  const remember = (ids: string[] | undefined, record: FindRecord) => {
+    for (const id of ids ?? []) {
+      if (!id) continue
+      findRecords.set(String(id), record)
+    }
+    // 长期运行也不能无限涨：超出上限就丢最老的记录。
+    while (findRecords.size > FIND_RECORD_LIMIT) {
+      const oldest = findRecords.keys().next().value
+      if (oldest === undefined) break
+      findRecords.delete(oldest)
+    }
+  }
+
+  const recordExpired = (record: FindRecord) => Date.now() - record.at > FIND_TTL_MS
+
+  const findRecord = (session: Session): FindRecord | null => {
+    const quoteId = String(session.quote?.id ?? session.quote?.messageId ?? '')
+    if (quoteId) {
+      const hit = findRecords.get(quoteId)
+      if (hit && !recordExpired(hit)) return hit
+      if (hit) findRecords.delete(quoteId)
+    }
+    // 有的平台引用消息不带 id：退回「这个人在这个会话里最近一次找鸡结果」。
+    // 仍要求引用内容确实是找鸡结果，避免引错消息、随口一句「不对」就触发。
+    if (!String(session.quote?.content ?? '').includes('找鸡结果')) return null
+    let latest: FindRecord | null = null
+    const channelId = String(session.channelId ?? '')
+    const userId = String(session.userId ?? '')
+    for (const record of findRecords.values()) {
+      if (record.channelId !== channelId || record.userId !== userId) continue
+      if (recordExpired(record)) continue
+      if (!latest || record.at > latest.at) latest = record
+    }
+    return latest
+  }
+
+  /**
+   * 发一个候选。X 账号会先抓主页 og 信息：显示名比搜索标题准，头像也一并带上。
+   * 抓不到就退回原来的名字逻辑、只发文字，绝不因为头像拖垮结果。
+   */
+  const sendFindReply = async (session: Session, record: FindRecord, label?: string) => {
+    const account = record.accounts[record.shown]
+    if (!account) return
+    let avatar: Buffer | undefined
+    let avatarMime = ''
+    if (account.platform === 'twitter') {
+      const profile = await fetchXProfile(account.handle)
+      if (profile?.name) account.authorName = profile.name
+      if (profile?.avatar) {
+        avatar = profile.avatar
+        avatarMime = profile.avatarMime || sniffMime(profile.avatar)
+      }
+    }
+    let text = formatReply({
+      accounts: [account],
+      candidates: record.candidates,
+      enginesUsed: record.enginesUsed,
+      failures: record.failures,
+      label
+    }).replace(/\*\*/g, '')
+    if (config.checkHint && account.platform === 'twitter') {
+      text += `\n\n· 想看这个号可信度：发「鉴定 ${account.handle}」`
+    }
+    const remaining = record.accounts.length - record.shown - 1
+    if (remaining > 0) {
+      text += `\n\n· 不是这个人？引用这条消息回复「不对」，看下一个候选（还有 ${remaining} 个）`
+    }
+    let ids: string[] | undefined
+    if (avatar) {
+      try {
+        ids = await session.send([h.image(avatar, avatarMime), h.text(text)])
+      } catch (error) {
+        logger.warn('带头像的找鸡结果发送失败，改发文字：%s', (error as Error)?.message ?? error)
+      }
+    }
+    if (!ids?.length) ids = await session.send(h.text(text))
+    remember(ids, record)
+  }
+
+  // 引用机器人刚才的找鸡结果、回复「不对」→ 换下一个候选。
+  ctx.middleware(async (session, next) => {
+    if (!session.quote) return next()
+    if (!DISLIKE_RE.test(String(session.content ?? '').trim())) return next()
+    const record = findRecord(session)
+    if (!record) return next()
+    if (record.shown + 1 >= record.accounts.length) {
+      await session.send('没有更多候选了。换张图再试，或者把原图发全一点。')
+      return
+    }
+    record.shown += 1
+    record.at = Date.now()
+    try {
+      await sendFindReply(session, record, `第 ${record.shown + 1} 个候选`)
+    } catch (error) {
+      logger.warn('发下一个候选失败：%s', (error as Error)?.message ?? error)
+      await session.send('换候选的时候出错了，稍后再试。')
+    }
+  })
+
   ctx.command('找鸡 [url:text]', '给一张图，反查这人是哪个 coser、账号在哪')
-    .usage('引用一张图发「找鸡」，或者带图发「找鸡」，也可以「找鸡 <图片网址>」。')
+    .usage('引用一张图发「找鸡」，或者带图发「找鸡」，也可以「找鸡 <图片网址>」。默认只回最像的那个人；如果认错了，引用结果消息回复「不对」，会依次给出其他候选。')
     .action(async ({ session }, url) => {
       if (!session) return
       const key = keyOf(session)
@@ -193,32 +298,37 @@ export function apply(ctx: Context, config: Config) {
       if (!image) return '要引用有图的那条再发「找鸡」'
       lastUse.set(key, Date.now())
       await session.send('收到，开始找鸡')
-      let text: string
-      let accounts: Account[]
+      let result: Awaited<ReturnType<typeof findChicken>>
       try {
-        ({ text, accounts } = await findChicken(image))
+        result = await findChicken(image)
       } catch (error) {
         logger.warn('找鸡失败：%s', (error as Error)?.stack ?? error)
         return h.text(`找鸡失败：${(error as Error)?.message ?? error}`)
       }
-      const twitter = accounts.find((account) => account.platform === 'twitter')
-      if (config.checkHint && twitter) {
-        text += `\n\n· 想看这个号可信度：发「鉴定 ${twitter.handle}」`
+      // 一个人都没认出来：直接发原来的「没找到」说明，不用记候选。
+      if (!result.accounts.length) return h.text(result.text)
+
+      const record: FindRecord = {
+        accounts: result.accounts,
+        candidates: result.candidates,
+        enginesUsed: result.enginesUsed,
+        failures: result.failures,
+        shown: 0,
+        at: Date.now(),
+        channelId: String(session.channelId ?? ''),
+        userId: String(session.userId ?? '')
       }
-      // 有账号、又有「已找到」图：图+文一条发出去（一条比两条稳）。
-      const found = accounts.length ? loadFoundImage() : null
+      await sendFindReply(session, record)
+
+      // 「已找到」表情包单独发一条：和结果混排容易被平台连图带字一起拒掉。
+      const found = loadFoundImage()
       if (found) {
-        let ids: string[] | undefined
-        try { ids = await session.send([h.image(found, sniffMime(found)), h.text(text)]) } catch { ids = undefined }
-        if (!ids?.length) {
-          logger.warn('图文混排被拒，改成两条')
-          try { await session.send(h.image(found, sniffMime(found))) } catch {}
-          await sleep(400)
-        } else {
-          return
+        try {
+          await session.send(h.image(found, sniffMime(found)))
+        } catch (error) {
+          logger.warn('发「已找到」图失败：%s', (error as Error)?.message ?? error)
         }
       }
-      return h.text(text)
     })
 
   ctx.command('鉴定 <target:text>', '查 X(Twitter) 账号可信度')
@@ -300,15 +410,6 @@ export function apply(ctx: Context, config: Config) {
 
       if (!groups.length) {
         return picked ? `「${picked.title}」暂时没有数据。` : 'flj.info 排行榜暂时没有数据。'
-      }
-
-      // 优先发嵌套转发：外层一个总合集，每个分类一个可展开的子合集。
-      if (config.rankNested) {
-        try {
-          if (await sendNestedForward(session, await buildNestedRankNodes(groups))) return
-        } catch (error) {
-          logger.warn('嵌套合并转发失败，改发平铺转发：%s', (error as Error)?.message ?? error)
-        }
       }
 
       try {

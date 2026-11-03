@@ -38,6 +38,18 @@ if (!fs.existsSync(ORIG_FILE)) {
   const orig = await import(pathToFileURL(ORIG_FILE).href)
   const origSafeFetch = await import(pathToFileURL(path.join(ORIG_DIR, 'src/safe-fetch.js')).href)
 
+  /**
+   * 有意差异：X 官方页面标题 `Naimi奶咪 (@Anaimiya2) / X` 没有平台徽标，原版会漏掉名字
+   * （移植版补上了这个分支，单测在 check.test.mjs）。为了让其余逻辑继续逐一对拍，
+   * 对拍前把这种标题补成原版认识的 Lens 卡片形态 `X名字 (@handle) / X`。
+   */
+  const adaptiveTitle = (title) => {
+    const text = String(title ?? '')
+    if (orig.profileTitleName(text).name) return text
+    const fixed = portAccounts.profileTitleName(text)
+    return fixed.name ? `X${fixed.name} (@${fixed.handle}) / X` : text
+  }
+
   // ── 随机候选列表 ────────────────────────────────────────────────────────
   function mulberry32(seed) {
     let a = seed >>> 0
@@ -110,7 +122,7 @@ if (!fs.existsSync(ORIG_FILE)) {
   ]
   const AUTHOR_POOL = ['', '豊栄@ﾄﾞﾔｧ…', '阿薰kaOri', 'Lumi', '画师A']
   const SIM_POOL = [null, 0.45, 0.8, 0.87, 0.93, 0.99]
-  const ENGINE_POOL = ['lens', 'saucenao', 'iqdb', 'tracemoe', 'baidu']
+  const ENGINE_POOL = ['lens', 'saucenao', 'iqdb', 'tracemoe', 'bing']
   const SNIPPET_POOL = ['', 'see https://x.com/snippet_user now', 'CN : 阿薰kaOri']
 
   const genCandidate = () => {
@@ -141,16 +153,19 @@ if (!fs.existsSync(ORIG_FILE)) {
   // ── 1. 常量 ─────────────────────────────────────────────────────────────
   test('constants', () => {
     assert.strictEqual(portEngines.LENS_EXTRACT, orig.LENS_EXTRACT, 'LENS_EXTRACT 必须和原版逐字节一致')
-    assert.deepStrictEqual(portAccounts.ENGINE_LABELS, orig.ENGINE_LABELS)
+    // 有意差异：百度识图引擎已从移植版删除，标签表里也不再保留 baidu。
+    const origLabels = { ...orig.ENGINE_LABELS }
+    delete origLabels.baidu
+    assert.deepStrictEqual(portAccounts.ENGINE_LABELS, origLabels)
     cmp(
-      () => portAccounts.engineLabels(['lens', 'saucenao', 'tracemoe', 'iqdb', 'baidu', 'unknown']),
-      () => orig.engineLabels(['lens', 'saucenao', 'tracemoe', 'iqdb', 'baidu', 'unknown'])
+      () => portAccounts.engineLabels(['lens', 'saucenao', 'tracemoe', 'iqdb', 'unknown']),
+      () => orig.engineLabels(['lens', 'saucenao', 'tracemoe', 'iqdb', 'unknown'])
     )
   })
 
   // ── 2. 解析器 ───────────────────────────────────────────────────────────
   test('parsers', () => {
-    for (const engine of ['saucenao', 'iqdb', 'tracemoe', 'baidu']) {
+    for (const engine of ['saucenao', 'iqdb', 'tracemoe']) {
       let n = 0
       for (const dir of [path.join(here, 'fixtures/parsers', engine), path.join(here, 'local/fixtures/parsers', engine)]) {
         if (!fs.existsSync(dir)) continue
@@ -158,10 +173,10 @@ if (!fs.existsSync(ORIG_FILE)) {
           const text = fs.readFileSync(path.join(dir, name), 'utf8')
           if (engine === 'saucenao') cmp(() => portEngines.parseSaucenao(text), () => orig.parseSaucenao(text))
           else if (engine === 'iqdb') cmp(() => portEngines.parseIqdb(text), () => orig.parseIqdb(text))
-          else if (engine === 'tracemoe') {
+          else {
             const payload = JSON.parse(text)
             cmp(() => portEngines.parseTracemoe(payload), () => orig.parseTracemoe(payload))
-          } else cmp(() => portEngines.parseBaiduGraph(text), () => orig.parseBaiduGraph(text))
+          }
           n++
         }
       }
@@ -182,6 +197,11 @@ if (!fs.existsSync(ORIG_FILE)) {
     const helpers = ['looksLikePersonName', 'normalizePersonName', 'authorNameFromTitle', 'nameFromTitleMention', 'socialNameFromTitle', 'profileTitleName']
     for (const title of corpus) {
       for (const name of helpers) {
+        // 名字修复本身是有意差异，由 check.test.mjs 的单测覆盖；其余标题照旧对拍。
+        if (name === 'profileTitleName' && adaptiveTitle(title) !== title) {
+          counts.titlesExtended = (counts.titlesExtended ?? 0) + 1
+          continue
+        }
         cmp(() => portAccounts[name](title), () => orig[name](title))
       }
       counts.titles++
@@ -209,7 +229,11 @@ if (!fs.existsSync(ORIG_FILE)) {
     return combos
   }
 
-  const runList = (list, { fullFormat }) => {
+  const runList = (rawList, { fullFormat }) => {
+    // 对拍前把「原版认不出名字」的官方标题补成徽标形态，见 adaptiveTitle 的说明。
+    const list = rawList.map((candidate) => candidate?.title
+      ? { ...candidate, title: adaptiveTitle(candidate.title) }
+      : candidate)
     cmp(
       () => portAccounts.dominantPersonName(structuredClone(list)),
       () => orig.dominantPersonName(structuredClone(list))

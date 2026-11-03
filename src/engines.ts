@@ -11,16 +11,16 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { validateFetchUrl } from './safe-fetch'
-import { matchPlatform, socialNameFromTitle } from './accounts'
+import { socialNameFromTitle } from './accounts'
 import type { Candidate, Failure } from './accounts'
 import { absUrl, hostOf, sleep, stripTags, trimText } from './utils'
 import { BROWSER_UA } from './constants'
 import { fileUploadHtml, resolveLensGoto, visit } from './browser'
-import type { BrowserTab, FishBrowser } from './browser'
+import type { FishBrowser } from './browser'
 
 export { UPLOAD_HOSTS, hostAllowed, BROWSER_UA, BROWSER_UA_CHROME } from './constants'
 
-export const ENGINE_IDS = ['saucenao', 'lens', 'baidu', 'iqdb', 'tracemoe'] as const
+export const ENGINE_IDS = ['saucenao', 'lens', 'iqdb', 'tracemoe'] as const
 export type EngineId = typeof ENGINE_IDS[number]
 
 // ── Google Lens ───────────────────────────────────────────────────────────
@@ -439,72 +439,6 @@ async function tracemoeSearch(bytes: Buffer, mimeType: string, { timeoutMs }: { 
   return parseTracemoe(await response.json())
 }
 
-// ── 百度识图（真浏览器上传）：结果是「相似图」，噪声大，只留账号主页形态的链接 ──
-export function parseBaiduGraph(html: string): Candidate[] {
-  const links = collectExternalLinks(html, {
-    base: 'https://graph.baidu.com/',
-    excludeHosts: ['baidu.com', 'bdstatic.com', 'baidupcs.com', 'bdimg.com', 'bdurl.net'],
-    cap: 60
-  })
-  const seen = new Set<string>()
-  const out: Candidate[] = []
-  for (const item of links) {
-    const hit = matchPlatform(item.url)
-    if (!hit) continue // 文章页 / 图集页一律不要，只认账号主页形态
-    const url = hit.url || item.url
-    if (seen.has(url)) continue
-    seen.add(url)
-    out.push({
-      engine: 'baidu',
-      similarity: null,
-      weak: true, // 相似图不一定同一个人，标记成弱证据
-      title: item.title,
-      sourceUrl: url,
-      authorUrl: '',
-      host: hostOf(url),
-      snippet: '',
-      links: [url]
-    })
-  }
-  return out
-}
-
-// 三家浏览器引擎的 DOM 都是「一堆外链卡片」，结构天天变，所以统一退到最稳的做法：
-// 抓所有外链、去重、排除引擎自家域名，锚文本能取到就取（取不到不影响账号抽取）。
-function collectExternalLinks(html: string, { base, excludeHosts = [], cap = 24 }: { base: string; excludeHosts?: string[]; cap?: number }): { url: string; host: string; title: string }[] {
-  const text = String(html ?? '')
-  const out: { url: string; host: string; title: string }[] = []
-  const seen = new Set<string>()
-  const anchorRe = /<a\b[^>]*?href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi
-  const push = (href: string, label: string) => {
-    const url = absUrl(href, base)
-    const host = hostOf(url)
-    if (!url || !host) return
-    if (excludeHosts.some((bad) => host === bad || host.endsWith('.' + bad))) return
-    if (seen.has(url)) return
-    seen.add(url)
-    out.push({
-      url,
-      host,
-      title: label ? trimText(stripTags(label), 120) : ''
-    })
-  }
-  let m: RegExpExecArray | null
-  while ((m = anchorRe.exec(text))) {
-    push(m[1], m[2])
-    if (out.length >= cap * 3) break
-  }
-  // 兜底：还有没被锚点包住的链接（JS 里拼的、property 里的）
-  if (out.length < cap) {
-    const hrefRe = /href="(https?:\/\/[^"]+)"/gi
-    while ((m = hrefRe.exec(text))) {
-      push(m[1], '')
-      if (out.length >= cap * 3) break
-    }
-  }
-  return out.slice(0, cap)
-}
-
 export interface ReverseSearchResult {
   candidates: Candidate[]
   failures: Failure[]
@@ -551,24 +485,6 @@ export async function reverseSearch(bytes: Buffer, mimeType: string, { engines, 
         }
       }
       return googleLensSearch(browser!, bytes, mimeType, { timeoutMs: Math.max(timeoutMs, 30000), tempDir })
-    }
-    if (engine === 'baidu') {
-      const dir = tempDir || os.tmpdir()
-      const file = path.join(dir, `fish-find-upload-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.${mimeType === 'image/png' ? 'png' : 'jpg'}`)
-      fs.writeFileSync(file, bytes)
-      try {
-        const { html } = await browser!.run((tab: BrowserTab) => fileUploadHtml(tab, {
-          startUrl: 'https://graph.baidu.com/pcpage/index?tpl_from=pc',
-          filePath: file,
-          fileSelector: 'input[type=file].general-upload-file',
-          settleMs: 2500,
-          timeoutMs: Math.max(timeoutMs, 30000),
-          waitForExpression: '(() => (document.querySelectorAll(\'a[href^="http"]\').length > 12 && document.body.innerText.length > 600))()'
-        }))
-        return parseBaiduGraph(html)
-      } finally {
-        try { fs.rmSync(file, { force: true }) } catch {}
-      }
     }
     throw new Error('未实现的引擎')
   }

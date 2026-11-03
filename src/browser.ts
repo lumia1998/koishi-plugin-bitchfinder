@@ -195,8 +195,8 @@ export interface FileUploadResult {
 
 /**
  * 用真浏览器打开一个页面、把本地图片塞进 <input type=file>，再等结果页落地取 DOM。
- * 有些站（百度识图这类）只认「页面上真选了一个文件」，用 fetch 拼 multipart 会被判据非法
- * （graph.baidu.com 一律回 `{"status":1002,"msg":"Params illegal"}`），所以必须走这条路。
+ * 有些站只认「页面上真选了一个文件」，用 fetch 拼 multipart 会被判非法，
+ * 所以必须走这条路。
  */
 export async function fileUploadHtml(tab: BrowserTab, { startUrl, filePath, fileSelector = 'input[type=file]', timeoutMs = 30000, settleMs = 4000, prepareExpression = '', submitExpression = '', waitForExpression = '', extractExpression = '' }: FileUploadOptions): Promise<FileUploadResult> {
   if (!hostAllowed(startUrl)) throw new Error(`域名不在白名单：${hostOf(startUrl)}`)

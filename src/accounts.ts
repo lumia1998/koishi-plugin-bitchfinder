@@ -88,8 +88,7 @@ const PLATFORM_RULES: { platform: string; re: RegExp; clean: (m: RegExpMatchArra
 // bilibili 的图文/视频页里带作者 mid 时才算 direct
 const BILIBILI_AUTHOR_RE = /\/(?:opus|video|read)\/.*?(?:mid=|space\.bilibili\.com\/)(\d{3,})/i
 
-// 同分时的平台顺序：微博 → B站 → Twitter → Instagram → Pixiv。
-// 按「国内 coser 最可能留号的地方」排，回话里第 1 条就是最可能有用的那个。
+// 同分时的平台顺序（数字越小越靠前）：Twitter → 微博 → B站 → Instagram → Pixiv。
 // 真人 coser 的号绝大部分在推特，微博其次；Pixiv 是画作平台（画师的作品页），
 // 不是「这个人自己的社交账号」，所以排在最后，回话里也要标出来。
 const PLATFORM_WEIGHT: Record<string, number> = { twitter: 1, weibo: 2, bilibili: 3, instagram: 4, pixiv: 9 }
@@ -97,7 +96,7 @@ const PLATFORM_WEIGHT: Record<string, number> = { twitter: 1, weibo: 2, bilibili
 // 画作平台：pixiv 上的是画师的作品/会员号，不是 coser 的主页。
 const ARTWORK_PLATFORMS = new Set(['pixiv'])
 
-// 「看着像账号、其实是页面」的路径前缀 —— 百度识图/搜索结果里这类链接特别多，
+// 「看着像账号、其实是页面」的路径前缀 —— 搜索结果里这类链接特别多，
 // 不挡掉就会把 `weibo.com/ttarticle/p/show?id=…` 当成一个叫 ttarticle 的账号报出去。
 const PATH_DENY: Record<string, string[]> = {
   weibo: ['ttarticle', 'p', 'show', 'status', 'detail', 'photo', 'video', 'article', 'fav', 'like', 'comment', 'search', 'hot', 'topic', 'tv', 'page', 's', 'weibo', 'login', 'signup', 'reg'],
@@ -389,6 +388,9 @@ export function socialNameFromTitle(title: string): string {
 /**
  * 主页卡片标题长这样：`X阿薰kaOri防盗版(@izayoill) / X`、`Instagram 某coser(@abc) • Instagram`。
  * 名字取 `(` 之前、去掉开头的平台徽标；顺带把 handle 也带出来（和 URL 互相印证）。
+ *
+ * X 官方页面的标题则是 `Naimi奶咪 (@Anaimiya2) / X` 或 `Naimi奶咪 (@Anaimiya2) on X`，
+ * 开头没有平台徽标。之前只认带徽标的 Lens 卡片，这种标题会整个漏掉，名字只能退回 handle。
  */
 export function profileTitleName(title: string): { name: string; handle: string } {
   const text = String(title ?? '').replace(/\s+/g, ' ').trim()
@@ -396,9 +398,23 @@ export function profileTitleName(title: string): { name: string; handle: string 
   const m = text.match(
     /^(?:X|Twitter|推特|Instagram|IG|Ins|TikTok|抖音|微博|Weibo|Bilibili|哔哩哔哩|Facebook|Threads)\s*(.{1,40}?)\s*[（(]\s*@?([A-Za-z0-9_.\-]{2,30})\s*[)）]/i
   )
-  if (!m) return { name: '', handle: '' }
-  const name = m[1].trim().replace(/[:：]+$/, '')
-  return { name, handle: m[2] }
+  if (m) {
+    const name = m[1].trim().replace(/[:：]+$/, '')
+    return { name, handle: m[2] }
+  }
+  const generic = text.match(/^(.{1,40}?)\s*[（(]\s*@([A-Za-z0-9_.\-]{2,30})\s*[)）]/)
+  if (!generic) return { name: '', handle: '' }
+  const name = generic[1].trim().replace(/[:：]+$/, '')
+  // 标题里的名字不能是平台徽标本身（`X (@foo)` 这种），也不能等于 handle。
+  if (!name || /^(?:x|twitter|ig|ins|instagram|weibo|bilibili|facebook|threads)$/i.test(name)) {
+    return { name: '', handle: '' }
+  }
+  if (name.replace(/^@/, '').toLowerCase() === generic[2].toLowerCase()) {
+    return { name: '', handle: '' }
+  }
+  // `Top posts on X (@someone)` 这种页面标题不是人：名字里带「on X / via Twitter」的一律不认。
+  if (/\b(on|via|by)\s+(x|twitter)\b/i.test(name)) return { name: '', handle: '' }
+  return { name, handle: generic[2] }
 }
 
 /** 名字：优先 weibo 昵称形态的 handle，其次「图源那一条候选的标题里像人名的片段」，最后退回 handle。 */
@@ -439,7 +455,7 @@ export function displayHandle(account: Account): string {
  *   🆔 账号：…（主页链接跟在账号后面，方便点开核对）
  * 多个账号之间空一行；inferred 的账号在账号行尾标「推断」。
  */
-export function formatReply({ accounts = [], candidates = [], enginesUsed = [], failures = [], cached = false, withImage = false, artworkDropped = 0, nameDropped = 0, consensusName = '', droppedHandles = [] }: {
+export function formatReply({ accounts = [], candidates = [], enginesUsed = [], failures = [], cached = false, withImage = false, artworkDropped = 0, nameDropped = 0, consensusName = '', droppedHandles = [], label = '' }: {
   accounts?: Account[]
   candidates?: Candidate[]
   enginesUsed?: string[]
@@ -450,6 +466,8 @@ export function formatReply({ accounts = [], candidates = [], enginesUsed = [], 
   nameDropped?: number
   consensusName?: string
   droppedHandles?: string[]
+  /** 追加在标题后的说明，比如「第 2 个候选」。 */
+  label?: string
 } = {}): string {
   const list = Array.isArray(accounts) ? accounts : []
   // 认出主轴时，优先给「写着这个人名字」的原帖：那才是你要顺着找的那条。
@@ -480,7 +498,8 @@ export function formatReply({ accounts = [], candidates = [], enginesUsed = [], 
         `🆔 账号：${handle}${guess}`
       ].join('\n')
     })
-    const head = `🎯 **找鸡结果**${cached ? '（缓存）' : ''}`
+    const extra = [label, cached ? '缓存' : ''].filter(Boolean).join(' · ')
+    const head = `🎯 **找鸡结果**${extra ? `（${extra}）` : ''}`
     let text = [head, '', blocks.join('\n\n')].join('\n')
     // 只有画作平台的结果时，得说清楚这不是 coser 本人的号
     if (list.every((account) => ARTWORK_PLATFORMS.has(account?.platform))) {
@@ -529,7 +548,6 @@ export const ENGINE_LABELS: Record<string, string> = {
   lens: '谷歌 Lens',
   tracemoe: '动漫截图溯源',
   iqdb: 'IQDB',
-  baidu: '百度识图',
   bing: '必应',
   yandex: 'Yandex',
   google: '谷歌识图'

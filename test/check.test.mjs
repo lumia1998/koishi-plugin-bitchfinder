@@ -2,7 +2,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { checkAccount, extractJson, normalizeHandle, pickModel, resolveModel } from '../lib/check/ai.js'
-import { buildNestedRankNodes, buildRankForward, formatRankText, formatReport } from '../lib/check/format.js'
+import { buildRankForward, formatRankText, formatReport } from '../lib/check/format.js'
+import { profileTitleName } from '../lib/accounts.js'
+import { metaContent, nameFromProfileTitle } from '../lib/profile.js'
 import { pickTop, RANK_CATEGORIES, resolveCategory } from '../lib/check/rank.js'
 import { RankFetcher } from '../lib/check/remote.js'
 import { calcScore, scoreTier } from '../lib/check/score.js'
@@ -208,59 +210,6 @@ test('buildRankForward 关闭头像时不发任何请求', async () => {
     assert.equal(calls, 0)
     assert.equal(element.attrs.forward, true)
     assert.equal(imagesOf(element).length, 0)
-  } finally {
-    globalThis.fetch = original
-  }
-})
-
-test('buildNestedRankNodes 产出「转发套转发」的原始 node 段', async () => {
-  const original = globalThis.fetch
-  globalThis.fetch = async () => new Response(PNG, { status: 200, headers: { 'Content-Type': 'image/png' } })
-  try {
-    const category = resolveCategory('评分最高')
-    const nodes = await buildNestedRankNodes([{ category, rows: [row({ avatarUrl: 'https://example.com/a.jpg' })] }])
-    assert.equal(nodes.length, 1)
-    assert.equal(nodes[0].type, 'node')
-    assert.equal(nodes[0].data.nickname, '评分最高')
-
-    // SnowLuma 只把「content 全是 node」的节点当成内层转发，混进 text 就会被拍平。
-    assert.ok(nodes[0].data.content.length > 0)
-    assert.ok(nodes[0].data.content.every((segment) => segment.type === 'node'))
-
-    const inner = nodes[0].data.content[0]
-    assert.equal(inner.type, 'node')
-    assert.equal(inner.data.nickname, 'Alice')
-    const text = inner.data.content.filter((segment) => segment.type === 'text').map((segment) => segment.data.text).join('')
-    assert.match(text, /@alice/)
-    assert.match(text, /https:\/\/x\.com\/alice/)
-
-    const image = inner.data.content.find((segment) => segment.type === 'image')
-    assert.equal(image.data.file, `base64://${PNG.toString('base64')}`)
-    assert.equal(image.data.cache, 0)
-  } finally {
-    globalThis.fetch = original
-  }
-})
-
-test('buildNestedRankNodes 头像下载失败时只发文字，且 avatars:false 不发请求', async () => {
-  const original = globalThis.fetch
-  let calls = 0
-  globalThis.fetch = async () => {
-    calls += 1
-    throw new Error('network down')
-  }
-  try {
-    const category = resolveCategory('评分最高')
-    const failed = await buildNestedRankNodes([{ category, rows: [row({ avatarUrl: 'https://example.com/a.jpg' })] }])
-    assert.equal(calls, 1)
-    assert.equal(failed[0].data.content[0].data.content.some((segment) => segment.type === 'image'), false)
-
-    const skipped = await buildNestedRankNodes(
-      [{ category, rows: [row({ avatarUrl: 'https://example.com/a.jpg' })] }],
-      { avatars: false }
-    )
-    assert.equal(calls, 1)
-    assert.equal(skipped[0].data.content[0].data.content.some((segment) => segment.type === 'image'), false)
   } finally {
     globalThis.fetch = original
   }
@@ -566,3 +515,30 @@ test('RankFetcher 接口失败时抛出可读错误', async () => {
   }
 })
 
+
+test('profileTitleName 认得出 X 官方页面标题里的中文名', () => {
+  assert.deepEqual(profileTitleName('Naimi奶咪 (@Anaimiya2) / X'), { name: 'Naimi奶咪', handle: 'Anaimiya2' })
+  assert.deepEqual(profileTitleName('Naimi奶咪 (@Anaimiya2) on X'), { name: 'Naimi奶咪', handle: 'Anaimiya2' })
+  // 带平台徽标的 Lens 卡片照旧
+  assert.deepEqual(profileTitleName('X阿薰kaOri防盗版(@izayoill) / X'), { name: '阿薰kaOri防盗版', handle: 'izayoill' })
+  // 名字就是 handle、或者根本不是这种标题，都不要硬凑
+  assert.deepEqual(profileTitleName('Anaimiya2 (@Anaimiya2) / X'), { name: '', handle: '' })
+  assert.deepEqual(profileTitleName('Top posts on X (@someone)'), { name: '', handle: '' })
+  assert.deepEqual(profileTitleName('随便一个标题'), { name: '', handle: '' })
+})
+
+test('metaContent 按属性名取 meta，不要求属性顺序', () => {
+  const html = '<meta content="Naimi奶咪 (@Anaimiya2) on X" property="og:title"><meta property="og:image" content="https://pbs.twimg.com/profile_images/1/a.jpg">'
+  assert.equal(metaContent(html, 'og:title'), 'Naimi奶咪 (@Anaimiya2) on X')
+  assert.equal(metaContent(html, 'og:image'), 'https://pbs.twimg.com/profile_images/1/a.jpg')
+  assert.equal(metaContent(html, 'og:description'), '')
+})
+
+test('nameFromProfileTitle 要求 handle 对得上', () => {
+  assert.equal(nameFromProfileTitle('Naimi奶咪 (@Anaimiya2) on X', 'Anaimiya2'), 'Naimi奶咪')
+  assert.equal(nameFromProfileTitle('Naimi奶咪 (@Anaimiya2) on X', 'anaimiya2'), 'Naimi奶咪')
+  assert.equal(nameFromProfileTitle('Naimi奶咪 (@Anaimiya2) on X', 'someoneelse'), '')
+  assert.equal(nameFromProfileTitle('Naimi奶咪 (@Anaimiya2) on X', ''), '')
+  assert.equal(nameFromProfileTitle('Anaimiya2 (@Anaimiya2) on X', 'Anaimiya2'), '')
+  assert.equal(nameFromProfileTitle('Naimi 奶咪 on X', 'Anaimiya2'), '')
+})

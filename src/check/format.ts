@@ -110,33 +110,8 @@ export async function buildRankForward(groups: RankGroup[], options: RankForward
 }
 
 /**
- * 转发套转发：外层合并转发里每个分类一个节点，分类节点的 content 又是一层转发
- * （里面 5 个人各一个节点）。SnowLuma / NapCat 会把「content 全是 node」的节点
- * 识别成内层转发，深度上限 3。
- *
- * Koishi 的 OneBot 适配器不支持嵌套（会把内层转发拆成独立消息），所以这里返回
- * OneBot 原始 node 段，调用方必须直接走 bot.internal.sendGroupForwardMsg。
+ * 下载头像：同一个 URL 只下载一次，失败记 null。
  */
-export async function buildNestedRankNodes(groups: RankGroup[], options: RankForwardOptions = {}): Promise<any[]> {
-  const avatars = await loadAvatars(groups, options)
-  return groups.map(({ category, rows }) => ({
-    type: 'node',
-    data: {
-      user_id: '10000',
-      nickname: category.title,
-      content: rows.map((row, index) => ({
-        type: 'node',
-        data: {
-          user_id: '10000',
-          nickname: row.displayName || row.handle,
-          content: personSegments(row, index, avatars)
-        }
-      }))
-    }
-  }))
-}
-
-/** 下载头像：同一个 URL 只下载一次，失败记 null。 */
 async function loadAvatars(groups: RankGroup[], options: RankForwardOptions): Promise<Map<string, Buffer | null>> {
   const timeoutMs = Math.max(1000, Number(options.avatarTimeoutMs) || AVATAR_TIMEOUT_MS)
   const maxBytes = Math.max(1024, Number(options.avatarMaxBytes) || AVATAR_MAX_BYTES)
@@ -166,17 +141,6 @@ function personText(row: RankEntry, index: number): string {
 function avatarBytes(avatars: Map<string, Buffer | null>, row: RankEntry): Buffer | null {
   const url = avatarOf(row.avatarUrl)
   return url ? avatars.get(url) ?? null : null
-}
-
-/** 内层转发的原始 OneBot 段（不能混 koishi 元素，必须直接发给适配器）。 */
-function personSegments(row: RankEntry, index: number, avatars: Map<string, Buffer | null>): any[] {
-  const segments: any[] = [{ type: 'text', data: { text: personText(row, index) } }]
-  const bytes = avatarBytes(avatars, row)
-  if (bytes) {
-    segments.push({ type: 'image', data: { file: `base64://${bytes.toString('base64')}`, cache: 0 } })
-  }
-  segments.push({ type: 'text', data: { text: `\n${profileUrl(row.handle)}` } })
-  return segments
 }
 
 /** 下载头像；任何失败（网络、超时、非图片、太大）都返回 null，调用方直接跳过头像。 */

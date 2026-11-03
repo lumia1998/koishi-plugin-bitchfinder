@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-bitchfinder",
-  "description": "根据图片和用户名找鸡和鉴别鸡：图片反查 coser/博主社媒账号，用户名鉴定 X 账号可信度与烧鸡榜",
-  "version": "2.4.0-alpha.0",
+  "description": "根据图片和用户名找鸡和鉴别鸡",
+  "version": "2.4.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
