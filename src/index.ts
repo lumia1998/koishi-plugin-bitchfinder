@@ -7,7 +7,7 @@ import path from 'node:path'
 import { extractAccounts, formatReply } from './accounts'
 import type { Account } from './accounts'
 import { FishBrowser } from './browser'
-import { buildRankForward, formatRankText, formatReport } from './check/format'
+import { buildNestedRankNodes, buildRankForward, formatRankText, formatReport } from './check/format'
 import type { RankGroup } from './check/format'
 import { buildRank, RANK_CATEGORIES, resolveCategory } from './check/rank'
 import { RankFetcher } from './check/remote'
@@ -54,6 +54,7 @@ export interface Config {
   checkCooldownSec: number
   checkDailyLimit: number
   rankSize: number
+  rankNested: boolean
   rankApiBase: string
   checkHint: boolean
 }
@@ -82,9 +83,27 @@ export const Config: Schema<Config> = Schema.object({
   checkCooldownSec: Schema.natural().default(30).description('鉴定冷却秒数（同一个人）。只对真正调用 AI 的请求生效，读缓存不受限。'),
   checkDailyLimit: Schema.natural().default(10).description('每个人每天最多鉴定几次（防止被人拿去刷你的 xAI 余额）。0 = 不限。'),
   rankSize: Schema.natural().min(1).default(5).description('烧鸡榜每个分类显示几个人。'),
+  rankNested: Schema.boolean().default(false).description('实验功能：烧鸡榜用嵌套合并转发，外层一个总合集、每个分类是一个可展开的子合集。需要 SnowLuma / NapCat 这类支持 node 套 node 的 OneBot 实现，其他实现会发送失败并自动退回平铺转发。默认关闭，直接发平铺转发。'),
   rankApiBase: Schema.string().default('https://flj.info/api/rankings').description('烧鸡榜的数据接口（flj.info 的公开排行榜）。留空 = 只用本机鉴定记录；接口连不上时会自动回退到本机记录。'),
   checkHint: Schema.boolean().default(true).description('找鸡查到 X 账号时，在结果末尾加一句「发鉴定 @用户名 查可信度」的提示。'),
 })
+
+/**
+ * 转发套转发只能绕过 Koishi 的 OneBot 适配器，直接发原始 node 段：
+ * 适配器会把 h('message', { forward: true }) 拆成独立消息，写不出嵌套。
+ * 仅 OneBot 平台可用，其他平台返回 false 让调用方走普通转发。
+ */
+async function sendNestedForward(session: Session, nodes: any[]): Promise<boolean> {
+  const bot = session.bot as any
+  if (!bot || bot.platform !== 'onebot' || !bot.internal) return false
+  const channelId = String(session.channelId ?? '')
+  if (session.isDirect) {
+    await bot.internal.sendPrivateForwardMsg(channelId.replace(/^private:/, ''), nodes)
+  } else {
+    await bot.internal.sendGroupForwardMsg(channelId, nodes)
+  }
+  return true
+}
 
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('bitchfinder')
@@ -281,6 +300,15 @@ export function apply(ctx: Context, config: Config) {
 
       if (!groups.length) {
         return picked ? `「${picked.title}」暂时没有数据。` : 'flj.info 排行榜暂时没有数据。'
+      }
+
+      // 优先发嵌套转发：外层一个总合集，每个分类一个可展开的子合集。
+      if (config.rankNested) {
+        try {
+          if (await sendNestedForward(session, await buildNestedRankNodes(groups))) return
+        } catch (error) {
+          logger.warn('嵌套合并转发失败，改发平铺转发：%s', (error as Error)?.message ?? error)
+        }
       }
 
       try {

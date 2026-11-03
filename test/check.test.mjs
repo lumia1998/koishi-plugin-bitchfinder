@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { checkAccount, extractJson, normalizeHandle, pickModel, resolveModel } from '../lib/check/ai.js'
-import { buildRankForward, formatRankText, formatReport } from '../lib/check/format.js'
+import { buildNestedRankNodes, buildRankForward, formatRankText, formatReport } from '../lib/check/format.js'
 import { pickTop, RANK_CATEGORIES, resolveCategory } from '../lib/check/rank.js'
 import { RankFetcher } from '../lib/check/remote.js'
 import { calcScore, scoreTier } from '../lib/check/score.js'
@@ -208,6 +208,59 @@ test('buildRankForward 关闭头像时不发任何请求', async () => {
     assert.equal(calls, 0)
     assert.equal(element.attrs.forward, true)
     assert.equal(imagesOf(element).length, 0)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('buildNestedRankNodes 产出「转发套转发」的原始 node 段', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = async () => new Response(PNG, { status: 200, headers: { 'Content-Type': 'image/png' } })
+  try {
+    const category = resolveCategory('评分最高')
+    const nodes = await buildNestedRankNodes([{ category, rows: [row({ avatarUrl: 'https://example.com/a.jpg' })] }])
+    assert.equal(nodes.length, 1)
+    assert.equal(nodes[0].type, 'node')
+    assert.equal(nodes[0].data.nickname, '评分最高')
+
+    // SnowLuma 只把「content 全是 node」的节点当成内层转发，混进 text 就会被拍平。
+    assert.ok(nodes[0].data.content.length > 0)
+    assert.ok(nodes[0].data.content.every((segment) => segment.type === 'node'))
+
+    const inner = nodes[0].data.content[0]
+    assert.equal(inner.type, 'node')
+    assert.equal(inner.data.nickname, 'Alice')
+    const text = inner.data.content.filter((segment) => segment.type === 'text').map((segment) => segment.data.text).join('')
+    assert.match(text, /@alice/)
+    assert.match(text, /https:\/\/x\.com\/alice/)
+
+    const image = inner.data.content.find((segment) => segment.type === 'image')
+    assert.equal(image.data.file, `base64://${PNG.toString('base64')}`)
+    assert.equal(image.data.cache, 0)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('buildNestedRankNodes 头像下载失败时只发文字，且 avatars:false 不发请求', async () => {
+  const original = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls += 1
+    throw new Error('network down')
+  }
+  try {
+    const category = resolveCategory('评分最高')
+    const failed = await buildNestedRankNodes([{ category, rows: [row({ avatarUrl: 'https://example.com/a.jpg' })] }])
+    assert.equal(calls, 1)
+    assert.equal(failed[0].data.content[0].data.content.some((segment) => segment.type === 'image'), false)
+
+    const skipped = await buildNestedRankNodes(
+      [{ category, rows: [row({ avatarUrl: 'https://example.com/a.jpg' })] }],
+      { avatars: false }
+    )
+    assert.equal(calls, 1)
+    assert.equal(skipped[0].data.content[0].data.content.some((segment) => segment.type === 'image'), false)
   } finally {
     globalThis.fetch = original
   }

@@ -94,37 +94,89 @@ const AVATAR_TIMEOUT_MS = 8000
 const AVATAR_MAX_BYTES = 2 * 1024 * 1024
 
 export async function buildRankForward(groups: RankGroup[], options: RankForwardOptions = {}): Promise<any> {
-  const timeoutMs = Math.max(1000, Number(options.avatarTimeoutMs) || AVATAR_TIMEOUT_MS)
-  const maxBytes = Math.max(1024, Number(options.avatarMaxBytes) || AVATAR_MAX_BYTES)
-  const withAvatars = options.avatars !== false
-
-  // 同一个头像可能在多个分类里重复出现，只下载一次。
-  const avatars = new Map<string, Buffer | null>()
-  const urls = new Set<string>()
-  if (withAvatars) {
-    for (const { rows } of groups) {
-      for (const row of rows) {
-        const url = avatarOf(row.avatarUrl)
-        if (url) urls.add(url)
-      }
-    }
-    await Promise.all([...urls].map(async (url) => {
-      avatars.set(url, await fetchAvatar(url, timeoutMs, maxBytes))
-    }))
-  }
+  const avatars = await loadAvatars(groups, options)
 
   const nodes = groups.map(({ category, rows }) => {
     const children: any[] = [h.text(`🏆 ${category.title}（${rows.length}）`)]
     rows.forEach((row, index) => {
-      children.push(h.text(`\n\n${index + 1}. ${row.displayName || row.handle}\n@${row.handle} · ${row.score}/200 ${scoreTier(row.score).icon}`))
-      const url = avatarOf(row.avatarUrl)
-      const bytes = url ? avatars.get(url) : null
+      children.push(h.text(`\n\n${personText(row, index)}`))
+      const bytes = avatarBytes(avatars, row)
       if (bytes) children.push(h.text('\n'), h.image(bytes, sniffMime(bytes)))
       children.push(h.text(`\n${profileUrl(row.handle)}`))
     })
     return h('message', { userId: '10000', nickname: category.title }, children)
   })
   return h('message', { forward: true }, nodes)
+}
+
+/**
+ * 转发套转发：外层合并转发里每个分类一个节点，分类节点的 content 又是一层转发
+ * （里面 5 个人各一个节点）。SnowLuma / NapCat 会把「content 全是 node」的节点
+ * 识别成内层转发，深度上限 3。
+ *
+ * Koishi 的 OneBot 适配器不支持嵌套（会把内层转发拆成独立消息），所以这里返回
+ * OneBot 原始 node 段，调用方必须直接走 bot.internal.sendGroupForwardMsg。
+ */
+export async function buildNestedRankNodes(groups: RankGroup[], options: RankForwardOptions = {}): Promise<any[]> {
+  const avatars = await loadAvatars(groups, options)
+  return groups.map(({ category, rows }) => ({
+    type: 'node',
+    data: {
+      user_id: '10000',
+      nickname: category.title,
+      content: rows.map((row, index) => ({
+        type: 'node',
+        data: {
+          user_id: '10000',
+          nickname: row.displayName || row.handle,
+          content: personSegments(row, index, avatars)
+        }
+      }))
+    }
+  }))
+}
+
+/** 下载头像：同一个 URL 只下载一次，失败记 null。 */
+async function loadAvatars(groups: RankGroup[], options: RankForwardOptions): Promise<Map<string, Buffer | null>> {
+  const timeoutMs = Math.max(1000, Number(options.avatarTimeoutMs) || AVATAR_TIMEOUT_MS)
+  const maxBytes = Math.max(1024, Number(options.avatarMaxBytes) || AVATAR_MAX_BYTES)
+  const withAvatars = options.avatars !== false
+
+  const avatars = new Map<string, Buffer | null>()
+  if (!withAvatars) return avatars
+
+  // 同一个头像可能在多个分类里重复出现，只下载一次。
+  const urls = new Set<string>()
+  for (const { rows } of groups) {
+    for (const row of rows) {
+      const url = avatarOf(row.avatarUrl)
+      if (url) urls.add(url)
+    }
+  }
+  await Promise.all([...urls].map(async (url) => {
+    avatars.set(url, await fetchAvatar(url, timeoutMs, maxBytes))
+  }))
+  return avatars
+}
+
+function personText(row: RankEntry, index: number): string {
+  return `${index + 1}. ${row.displayName || row.handle}\n@${row.handle} · ${row.score}/200 ${scoreTier(row.score).icon}`
+}
+
+function avatarBytes(avatars: Map<string, Buffer | null>, row: RankEntry): Buffer | null {
+  const url = avatarOf(row.avatarUrl)
+  return url ? avatars.get(url) ?? null : null
+}
+
+/** 内层转发的原始 OneBot 段（不能混 koishi 元素，必须直接发给适配器）。 */
+function personSegments(row: RankEntry, index: number, avatars: Map<string, Buffer | null>): any[] {
+  const segments: any[] = [{ type: 'text', data: { text: personText(row, index) } }]
+  const bytes = avatarBytes(avatars, row)
+  if (bytes) {
+    segments.push({ type: 'image', data: { file: `base64://${bytes.toString('base64')}`, cache: 0 } })
+  }
+  segments.push({ type: 'text', data: { text: `\n${profileUrl(row.handle)}` } })
+  return segments
 }
 
 /** 下载头像；任何失败（网络、超时、非图片、太大）都返回 null，调用方直接跳过头像。 */
