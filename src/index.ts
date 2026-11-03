@@ -11,7 +11,7 @@ import { buildRankForward, formatRankText, formatReport } from './check/format'
 import type { RankGroup } from './check/format'
 import { buildRank, RANK_CATEGORIES, resolveCategory } from './check/rank'
 import { RankFetcher } from './check/remote'
-import { UserError, Verifier } from './check/service'
+import { parseCheckTarget, UserError, Verifier } from './check/service'
 import { AccountStore, defineModel } from './check/store'
 import { registerCheckBitchTool } from './check/tool'
 import { reverseSearch } from './engines'
@@ -78,7 +78,7 @@ export const Config: Schema<Config> = Schema.object({
   aiApiKey: Schema.string().role('secret').default('').description('xAI API Key（console.x.ai 生成）。不填则「鉴定」不可用。按量收费，每次鉴定跑两次 x_search。'),
   aiModel: Schema.string().default('').description('模型名。留空 = 自动从 /v1/models 选最新可用的 grok 文本模型（推荐）；也可以手动填 grok-4.7 固定型号。'),
   aiTimeoutMs: Schema.natural().role('ms').default(180000).description('单次 xAI 请求超时。x_search 要真去 X 搜资料和评价，完整鉴定实测 60–90 秒，默认 180 秒留足余量。'),
-  cacheHours: Schema.natural().default(72).description('鉴定结果的复用时长（小时）。期间同一个人再查直接读库，不重复扣 xAI 费用。0 = 每次都重新查。'),
+  cacheHours: Schema.natural().default(0).description('鉴定结果存数据库，有就直接读，不重复扣 xAI 费用。0（默认）= 永不过期；填 N = 超过 N 小时后再查会自动重新鉴定。想立刻重查发「鉴定 @用户名 刷新」。'),
   checkCooldownSec: Schema.natural().default(30).description('鉴定冷却秒数（同一个人）。只对真正调用 AI 的请求生效，读缓存不受限。'),
   checkDailyLimit: Schema.natural().default(10).description('每个人每天最多鉴定几次（防止被人拿去刷你的 xAI 余额）。0 = 不限。'),
   rankSize: Schema.natural().min(1).default(5).description('烧鸡榜每个分类显示几个人。'),
@@ -203,26 +203,29 @@ export function apply(ctx: Context, config: Config) {
     })
 
   ctx.command('鉴定 <target:text>', '查 X(Twitter) 账号可信度')
-    .usage('发「鉴定 @用户名」，或者「鉴定 https://x.com/用户名」。AI 会去 X 上搜账号资料和他人评价，给出 0–200 的可信度、标签和风险。')
+    .usage('发「鉴定 @用户名」，或者「鉴定 https://x.com/用户名」。AI 会去 X 上搜账号资料和他人评价，给出 0–200 的可信度、标签和风险。结果会存进数据库，之后同一个人再查直接读库、不再花 xAI 费用；想重新查就发「鉴定 @用户名 刷新」。')
     .example('鉴定 @alice')
+    .example('鉴定 @alice 刷新')
     .action(async ({ session }, target) => {
       if (!session) return
       if (!config.aiApiKey) return '还没配置 xAI API Key：在插件配置里填上 aiApiKey 才能鉴定。'
-      const handle = String(target ?? '').trim()
-      if (!handle) return '用法：鉴定 @用户名，或者 鉴定 https://x.com/用户名'
+      const raw = String(target ?? '').trim()
+      if (!raw) return '用法：鉴定 @用户名，或者 鉴定 https://x.com/用户名'
+      // 刷新词可放开头或结尾；结果仍受冷却和每日上限限制。
+      const { handle, refresh } = parseCheckTarget(raw)
+      if (!handle) return '要刷新谁？发「鉴定 @用户名 刷新」。'
       let normalized: string
       try {
         normalized = verifier.normalize(handle)
       } catch (error) {
         return (error as Error).message
       }
-      await session.send(`收到，正在鉴定 @${normalized}（要搜一会儿，别急）`)
+      await session.send(`收到，正在${refresh ? '重新' : ''}鉴定 @${normalized}（要搜一会儿，别急）`)
       try {
-        const outcome = await verifier.check(normalized, `${keyOf(session)}|check`)
+        const outcome = await verifier.check(normalized, `${keyOf(session)}|check`, { refresh })
         return h.text(formatReport(outcome.row, {
           cached: outcome.cached,
-          stale: outcome.stale,
-          cacheHours: config.cacheHours
+          stale: outcome.stale
         }))
       } catch (error) {
         if (!(error instanceof UserError)) logger.warn('鉴定失败：%s', (error as Error)?.stack ?? error)
@@ -281,7 +284,15 @@ export function apply(ctx: Context, config: Config) {
       }
 
       try {
-        await session.send(buildRankForward(groups))
+        // buildRankForward 会先下载头像转成 base64：节点里放远程 URL 时机器人下载失败会让整条转发挂掉。
+        await session.send(await buildRankForward(groups))
+        return
+      } catch (error) {
+        logger.warn('带头像的合并转发失败，改发纯文字转发：%s', (error as Error)?.message ?? error)
+      }
+      try {
+        // 头像（base64）仍可能因为体积/平台限制被拒，去掉图再试一次。
+        await session.send(await buildRankForward(groups, { avatars: false }))
         return
       } catch (error) {
         logger.warn('合并转发失败，回退纯文字：%s', (error as Error)?.message ?? error)

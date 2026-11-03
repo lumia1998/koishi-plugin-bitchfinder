@@ -45,7 +45,7 @@ export function defineModel(ctx: Context) {
 
 export interface AccountStoreOptions {
   logger: Logger
-  /** 结果在这么多小时内算新鲜，直接复用不再调 AI。 */
+  /** 结果超过这么多小时才自动重新鉴定；0 = 永不过期（数据库里有就直接用）。 */
   cacheHours: number
 }
 
@@ -63,9 +63,10 @@ export class AccountStore {
     return (this.ctx as any).database
   }
 
+  /** 是否需要自动重新鉴定：0 = 永不过期；否则超过 cacheHours 小时才算过期。 */
   isFresh(row: AccountRow): boolean {
     const hours = Math.max(0, Number(this.options.cacheHours) || 0)
-    if (!hours) return false
+    if (!hours) return true
     const at = new Date(row.searchedAt).getTime()
     return Number.isFinite(at) && Date.now() - at < hours * 3600_000
   }

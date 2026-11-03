@@ -6,7 +6,7 @@ import { buildRankForward, formatRankText, formatReport } from '../lib/check/for
 import { pickTop, RANK_CATEGORIES, resolveCategory } from '../lib/check/rank.js'
 import { RankFetcher } from '../lib/check/remote.js'
 import { calcScore, scoreTier } from '../lib/check/score.js'
-import { Verifier } from '../lib/check/service.js'
+import { parseCheckTarget, Verifier } from '../lib/check/service.js'
 import { AccountStore } from '../lib/check/store.js'
 
 test('normalizeHandle 接受 @、裸用户名和 x/twitter 链接', () => {
@@ -103,7 +103,7 @@ test('pickTop 按标签过滤', () => {
 })
 
 test('formatReport 含分数、标签和主页，且不超长', () => {
-  const text = formatReport(row({ accountTags: ['风俗业者'], riskTags: ['scam'], complaints: 2, detail: '长'.repeat(500) }), { cached: true, cacheHours: 72 })
+  const text = formatReport(row({ accountTags: ['风俗业者'], riskTags: ['scam'], complaints: 2, detail: '长'.repeat(500) }), { cached: true })
   assert.match(text, /@alice/)
   assert.match(text, /80\/200/)
   assert.match(text, /风俗业者/)
@@ -119,13 +119,98 @@ test('formatRankText 每个分类都列出主页', () => {
   assert.match(text, /https:\/\/x\.com\/alice/)
 })
 
-test('buildRankForward 生成合并转发节点', () => {
-  const category = resolveCategory('评分最高')
-  const element = buildRankForward([{ category, rows: [row({ avatarUrl: 'https://example.com/a.jpg' })] }])
-  assert.equal(element.type, 'message')
-  assert.equal(element.attrs.forward, true)
-  assert.equal(element.children.length, 1)
-  assert.equal(element.children[0].attrs.nickname, '评分最高')
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64')
+
+/** 收集合并转发节点里的图片元素（OneBot 适配器只认 base64://，不能留远程 URL）。 */
+function imagesOf(element) {
+  const found = []
+  const walk = (items) => {
+    for (const item of items ?? []) {
+      if (item?.type === 'img' || item?.type === 'image') found.push(item)
+      if (item?.children) walk(item.children)
+    }
+  }
+  walk(element.children)
+  return found
+}
+
+test('buildRankForward 把头像下载成 base64 再放进节点', async () => {
+  const original = globalThis.fetch
+  const urls = []
+  globalThis.fetch = async (url) => {
+    urls.push(String(url))
+    return new Response(PNG, { status: 200, headers: { 'Content-Type': 'image/png' } })
+  }
+  try {
+    const category = resolveCategory('评分最高')
+    const element = await buildRankForward([{ category, rows: [row({ avatarUrl: 'https://example.com/a.jpg' })] }])
+    assert.equal(element.type, 'message')
+    assert.equal(element.attrs.forward, true)
+    assert.equal(element.children.length, 1)
+    assert.equal(element.children[0].attrs.nickname, '评分最高')
+    assert.deepEqual(urls, ['https://example.com/a.jpg'])
+
+    const images = imagesOf(element)
+    assert.equal(images.length, 1)
+    assert.equal(images[0].attrs.src, `data:image/png;base64,${PNG.toString('base64')}`)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('buildRankForward 头像下载失败时省略图片，文字照发', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = async () => { throw new Error('network down') }
+  try {
+    const category = resolveCategory('评分最高')
+    const element = await buildRankForward([{ category, rows: [row({ avatarUrl: 'https://example.com/a.jpg' })] }])
+    assert.equal(element.attrs.forward, true)
+    assert.equal(imagesOf(element).length, 0)
+    const text = JSON.stringify(element)
+    assert.match(text, /@alice/)
+    assert.match(text, /https:\/\/x\.com\/alice/)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('buildRankForward 相同头像只下载一次，非图片内容被丢弃', async () => {
+  const original = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls += 1
+    return new Response('<html>nope</html>', { status: 200, headers: { 'Content-Type': 'text/html' } })
+  }
+  try {
+    const category = resolveCategory('评分最高')
+    const rows = [
+      row({ handle: 'a', avatarUrl: 'https://example.com/a.jpg' }),
+      row({ handle: 'b', avatarUrl: 'https://example.com/a.jpg' })
+    ]
+    const element = await buildRankForward([{ category, rows }])
+    assert.equal(calls, 1)
+    assert.equal(imagesOf(element).length, 0)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('buildRankForward 关闭头像时不发任何请求', async () => {
+  const original = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls += 1
+    return new Response(PNG, { status: 200, headers: { 'Content-Type': 'image/png' } })
+  }
+  try {
+    const category = resolveCategory('评分最高')
+    const element = await buildRankForward([{ category, rows: [row({ avatarUrl: 'https://example.com/a.jpg' })] }], { avatars: false })
+    assert.equal(calls, 0)
+    assert.equal(element.attrs.forward, true)
+    assert.equal(imagesOf(element).length, 0)
+  } finally {
+    globalThis.fetch = original
+  }
 })
 
 test('AccountStore 没有 database 时用内存，重复 save 累加次数', async () => {
@@ -242,6 +327,56 @@ test('Verifier 命中缓存不再调 AI，日报上限会拒绝', async () => {
     assert.equal(second.cached, true)
     assert.equal(stub.calls(), 2)
     await assert.rejects(() => verifier.check('@bob', 'u1'), /今天已经鉴定 1 次/)
+  } finally {
+    stub.restore()
+  }
+})
+
+test('parseCheckTarget 识别开头/结尾的刷新词', () => {
+  assert.deepEqual(parseCheckTarget('@alice'), { handle: '@alice', refresh: false })
+  assert.deepEqual(parseCheckTarget('@alice 刷新'), { handle: '@alice', refresh: true })
+  assert.deepEqual(parseCheckTarget('刷新 @alice'), { handle: '@alice', refresh: true })
+  assert.deepEqual(parseCheckTarget('alice --refresh'), { handle: 'alice', refresh: true })
+  assert.deepEqual(parseCheckTarget('https://x.com/alice 重新查'), { handle: 'https://x.com/alice', refresh: true })
+  assert.deepEqual(parseCheckTarget('刷新'), { handle: '', refresh: true })
+})
+
+test('isFresh：cacheHours=0 永不过期，填了小时数才按时间过期', () => {
+  const ctx = { logger: () => ({ warn() {}, info() {} }) }
+  const forever = new AccountStore(ctx, { logger: { warn() {} }, cacheHours: 0 })
+  assert.equal(forever.isFresh(row({ searchedAt: new Date('2000-01-01') })), true)
+  const expire = new AccountStore(ctx, { logger: { warn() {} }, cacheHours: 72 })
+  assert.equal(expire.isFresh(row({ searchedAt: new Date('2000-01-01') })), false)
+  assert.equal(expire.isFresh(row({ searchedAt: new Date() })), true)
+})
+
+test('Verifier 数据库有记录就直接读，只有 refresh 才重新调 AI', async () => {
+  const ctx = { logger: () => ({ warn() {}, info() {} }) }
+  const store = new AccountStore(ctx, { logger: { warn() {} }, cacheHours: 0 })
+  const stub = stubXai(PROFILE, { complaints: 0, positives: 0, complaint_types: [], positive_types: [], complaint_examples: [], positive_examples: [] })
+  try {
+    const verifier = new Verifier({
+      logger: { warn() {} }, store,
+      baseUrl: 'https://api.x.ai/v1', apiKey: 'test', model: 'x', timeoutMs: 5000,
+      cooldownSec: 0, dailyLimit: 0, cacheHours: 0
+    })
+    const first = await verifier.check('@alice', 'u1')
+    assert.equal(first.cached, false)
+    assert.equal(stub.calls(), 2)
+
+    // 即使记录很旧，cacheHours=0 也直接复用
+    const saved = await store.get('alice')
+    saved.searchedAt = new Date('2000-01-01')
+    const second = await verifier.check('@alice', 'u1')
+    assert.equal(second.cached, true)
+    assert.equal(stub.calls(), 2)
+
+    // 明确要求刷新才重新调 AI，并覆盖原记录
+    const third = await verifier.check('@alice', 'u1', { refresh: true })
+    assert.equal(third.cached, false)
+    assert.equal(stub.calls(), 4)
+    assert.equal(third.row.id, second.row.id)
+    assert.equal(third.row.searchCount, 2)
   } finally {
     stub.restore()
   }

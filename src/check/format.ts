@@ -1,5 +1,7 @@
 // 鉴定报告与烧鸡榜的文本 / 合并转发格式。
 import { h } from 'koishi'
+import { sniffMime } from '../image'
+import { looksLikeImageBuffer } from '../safe-fetch'
 import { positiveLabel, resultTags, riskLabel, scoreTier } from './score'
 import type { RankCategory } from './rank'
 import type { AccountRow, RankEntry } from './types'
@@ -16,7 +18,7 @@ export function profileUrl(handle: string): string {
 }
 
 /** 单个账号的文字报告，控制在 900 字以内（QQ 长消息容易被截）。 */
-export function formatReport(row: AccountRow, options: { cached?: boolean; stale?: boolean; cacheHours?: number } = {}): string {
+export function formatReport(row: AccountRow, options: { cached?: boolean; stale?: boolean } = {}): string {
   const tier = scoreTier(row.score)
   const lines: string[] = []
   lines.push(`🔍 鉴定结果 · @${row.handle}`)
@@ -66,28 +68,90 @@ export function formatReport(row: AccountRow, options: { cached?: boolean; stale
   if (options.stale) {
     lines.push('⚠️ 这次没搜成功，先给你看上次的结果。')
   } else if (options.cached) {
-    const hours = Math.max(0, Number(options.cacheHours) || 0)
-    lines.push(hours
-      ? `🔁 来自缓存（${hours} 小时内不重复调 AI，再查会更新）`
-      : '🔁 来自缓存（上次的结果）')
+    lines.push(`🔁 数据库里已有记录（想重新查：鉴定 ${row.handle} 刷新）`)
   }
 
   return trimLines(lines, 900)
 }
 
-/** 合并转发：每个分类一个节点，节点里按名次放头像 / 名字 / 主页。 */
-export function buildRankForward(groups: RankGroup[]): any {
+/** 合并转发：每个分类一个节点，节点里按名次放头像 / 名字 / 主页。
+ *
+ * 头像必须先在本地下载成字节再塞进节点（h.image(Buffer) → data URI → OneBot 的 base64://）。
+ * 节点里直接放远程 URL 时，由机器人宿主去 pbs.twimg.com 下载，墙、超时或 403 都会让
+ * send_group_forward_msg 整条失败（retcode 100）。这里下载失败就省略那张头像，
+ * 文字和链接照发，绝不让一张头像拖垮整条转发。
+ */
+export interface RankForwardOptions {
+  /** 是否带头像（默认 true）。转发被平台拒绝时可以用 false 重试一次纯文字转发。 */
+  avatars?: boolean
+  /** 单张头像的下载超时（毫秒）。 */
+  avatarTimeoutMs?: number
+  /** 单张头像的大小上限（字节）。 */
+  avatarMaxBytes?: number
+}
+
+const AVATAR_TIMEOUT_MS = 8000
+const AVATAR_MAX_BYTES = 2 * 1024 * 1024
+
+export async function buildRankForward(groups: RankGroup[], options: RankForwardOptions = {}): Promise<any> {
+  const timeoutMs = Math.max(1000, Number(options.avatarTimeoutMs) || AVATAR_TIMEOUT_MS)
+  const maxBytes = Math.max(1024, Number(options.avatarMaxBytes) || AVATAR_MAX_BYTES)
+  const withAvatars = options.avatars !== false
+
+  // 同一个头像可能在多个分类里重复出现，只下载一次。
+  const avatars = new Map<string, Buffer | null>()
+  const urls = new Set<string>()
+  if (withAvatars) {
+    for (const { rows } of groups) {
+      for (const row of rows) {
+        const url = avatarOf(row.avatarUrl)
+        if (url) urls.add(url)
+      }
+    }
+    await Promise.all([...urls].map(async (url) => {
+      avatars.set(url, await fetchAvatar(url, timeoutMs, maxBytes))
+    }))
+  }
+
   const nodes = groups.map(({ category, rows }) => {
     const children: any[] = [h.text(`🏆 ${category.title}（${rows.length}）`)]
     rows.forEach((row, index) => {
       children.push(h.text(`\n\n${index + 1}. ${row.displayName || row.handle}\n@${row.handle} · ${row.score}/200 ${scoreTier(row.score).icon}`))
-      const avatar = avatarOf(row.avatarUrl)
-      if (avatar) children.push(h.text('\n'), h.image(avatar))
+      const url = avatarOf(row.avatarUrl)
+      const bytes = url ? avatars.get(url) : null
+      if (bytes) children.push(h.text('\n'), h.image(bytes, sniffMime(bytes)))
       children.push(h.text(`\n${profileUrl(row.handle)}`))
     })
     return h('message', { userId: '10000', nickname: category.title }, children)
   })
   return h('message', { forward: true }, nodes)
+}
+
+/** 下载头像；任何失败（网络、超时、非图片、太大）都返回 null，调用方直接跳过头像。 */
+async function fetchAvatar(url: string, timeoutMs: number, maxBytes: number): Promise<Buffer | null> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      redirect: 'follow',
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
+        accept: 'image/*,*/*;q=0.8'
+      }
+    })
+    if (!response.ok) return null
+    const declared = Number(response.headers.get('content-length') || 0)
+    if (declared > maxBytes) return null
+    const bytes = Buffer.from(await response.arrayBuffer())
+    if (!bytes.length || bytes.length > maxBytes) return null
+    if (!looksLikeImageBuffer(bytes)) return null
+    return bytes
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /** 合并转发不可用时的回退：纯文字榜单。 */

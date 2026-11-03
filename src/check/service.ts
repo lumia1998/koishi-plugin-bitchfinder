@@ -27,6 +27,20 @@ export interface VerifyOutcome {
   stale?: boolean
 }
 
+export interface CheckOptions {
+  /** 用户明确要求重新鉴定：忽略已有记录，重新调 AI 后覆盖。 */
+  refresh?: boolean
+}
+
+const REFRESH_TOKEN = /(?:^|\s)(?:刷新|重新查|重查|--refresh|-f)(?=\s|$)/i
+
+/** 解析「@用户名 刷新」这类输入：刷新词可以放开头或结尾，返回纯用户名和是否强制刷新。 */
+export function parseCheckTarget(raw: string): { handle: string; refresh: boolean } {
+  const text = String(raw ?? '').trim()
+  const handle = text.replace(new RegExp(REFRESH_TOKEN.source, 'gi'), ' ').trim()
+  return { handle, refresh: REFRESH_TOKEN.test(text) }
+}
+
 export class Verifier {
   private lastUse = new Map<string, number>()
   private daily = new Map<string, { day: string; count: number }>()
@@ -41,12 +55,14 @@ export class Verifier {
     return handle
   }
 
-  async check(rawHandle: string, sessionKey?: string): Promise<VerifyOutcome> {
+  async check(rawHandle: string, sessionKey?: string, options: CheckOptions = {}): Promise<VerifyOutcome> {
     const handle = this.normalize(rawHandle)
     const { store, logger } = this.options
 
+    // 数据库里有就直接读，不再调 AI。只有没记录、设置了过期时间且已过期，
+    // 或者用户明确要求「刷新」时才重新鉴定（xAI 按量收费，别白花钱）。
     const cached = await store.get(handle)
-    if (cached && store.isFresh(cached)) return { row: cached, cached: true }
+    if (cached && !options.refresh && store.isFresh(cached)) return { row: cached, cached: true }
 
     const running = this.inFlight.get(handle)
     if (running) return running
