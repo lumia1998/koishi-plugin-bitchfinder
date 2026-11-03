@@ -1,4 +1,5 @@
-// 鱼鱼找鸡 Koishi 版：被引图片 → 反查来源 → 抽 coser 社媒账号 → 回一句话（有账号时顺带「已找到鸡」图）。
+// 找鸡 + 鉴定 + 烧鸡榜 Koishi 插件：图片反查社媒账号，用户名鉴定 X 账号可信度。
+// 另带 X 账号鉴定（xAI x_search）与烧鸡榜。
 import { Context, Schema, Session, h } from 'koishi'
 import type {} from 'koishi-plugin-puppeteer'
 import fs from 'node:fs'
@@ -6,6 +7,11 @@ import path from 'node:path'
 import { extractAccounts, formatReply } from './accounts'
 import type { Account } from './accounts'
 import { FishBrowser } from './browser'
+import { buildRankForward, formatRankText, formatReport } from './check/format'
+import { buildRank, RANK_CATEGORIES, resolveCategory } from './check/rank'
+import { UserError, Verifier } from './check/service'
+import { AccountStore, defineModel } from './check/store'
+import { registerCheckBitchTool } from './check/tool'
 import { reverseSearch } from './engines'
 import type { EngineId } from './engines'
 import { imageFromSession, imageFromUrl, sniffMime } from './image'
@@ -14,15 +20,19 @@ import { registerFindBitchTool } from './tool'
 import { sleep } from './utils'
 
 export const name = 'bitchfinder'
-export const inject = { required: ['puppeteer'], optional: ['chatluna'] }
+export const inject = { required: ['puppeteer'], optional: ['chatluna', 'database'] }
 
-export const usage = `给一张图，反查这人是哪个 coser、账号在哪（移植自 鱼鱼找鸡 v1.0.0）。
+export const usage = `根据图片和用户名找鸡和鉴别鸡：给一张图反查 coser/博主的社媒账号；给一个 X 用户名鉴定真实度和风险。
 
 需要 puppeteer 服务（谷歌 Lens / 百度识图用浏览器跑）。
 
-用法：引用一张图发「找鸡」（或带图发）。
+用法：
+· 引用一张图发「找鸡」（或带图发）
+· 发「鉴定 @用户名」查 X 账号可信度（需要 xAI API Key）
+· 发「烧鸡榜」看鉴定过的账号排行
 
-反查必须把图发给引擎（谷歌 / SauceNAO / trace.moe …），不想上传就别用。`
+反查必须把图发给引擎（谷歌 / SauceNAO / trace.moe …），不想上传就别用。
+鉴定会把用户名发给 xAI，由它去 X 上搜公开资料和他人评价。`
 
 export interface Config {
   engines: EngineId[]
@@ -34,6 +44,15 @@ export interface Config {
   foundImage: string
   cooldownSec: number
   registerTool: boolean
+  aiBaseUrl: string
+  aiApiKey: string
+  aiModel: string
+  aiTimeoutMs: number
+  cacheHours: number
+  checkCooldownSec: number
+  checkDailyLimit: number
+  rankSize: number
+  checkHint: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -52,12 +71,39 @@ export const Config: Schema<Config> = Schema.object({
   foundImage: Schema.string().default('').description('查到账号时顺带发的图（本机文件路径，相对路径按 Koishi 根目录算，比如一张「找到了」的表情包）。留空 = 不发图。'),
   cooldownSec: Schema.natural().default(30).description('同一个人在同一个会话里的冷却秒数（反查引擎有免费额度，刷爆了大家都不能用）。0 = 不限。'),
   registerTool: Schema.boolean().default(true).description('装了 ChatLuna 时注册工具 findbitch，让模型按需反查。'),
+  aiBaseUrl: Schema.string().default('https://api.x.ai/v1').description('xAI API 地址，默认官方地址。只支持 xAI：鉴定靠 x_search 去 X 上搜实时资料，换别家模型不成立。'),
+  aiApiKey: Schema.string().role('secret').default('').description('xAI API Key（console.x.ai 生成）。不填则「鉴定」不可用。按量收费，每次鉴定跑两次 x_search。'),
+  aiModel: Schema.string().default('grok-4.3').description('模型名。官方文档里的当前型号是 grok-4.3 / grok-4.5 等；如果报 404，换成账号可用的型号。'),
+  aiTimeoutMs: Schema.natural().role('ms').default(60000).description('单次 xAI 请求超时。鉴定要跑两次并行搜索，给足时间。'),
+  cacheHours: Schema.natural().default(72).description('鉴定结果的复用时长（小时）。期间同一个人再查直接读库，不重复扣 xAI 费用。0 = 每次都重新查。'),
+  checkCooldownSec: Schema.natural().default(30).description('鉴定冷却秒数（同一个人）。只对真正调用 AI 的请求生效，读缓存不受限。'),
+  checkDailyLimit: Schema.natural().default(10).description('每个人每天最多鉴定几次（防止被人拿去刷你的 xAI 余额）。0 = 不限。'),
+  rankSize: Schema.natural().min(1).default(5).description('烧鸡榜每个分类显示几个人。'),
+  checkHint: Schema.boolean().default(true).description('找鸡查到 X 账号时，在结果末尾加一句「发鉴定 @用户名 查可信度」的提示。'),
 })
 
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('bitchfinder')
   const browser = new FishBrowser(ctx, { proxy: config.proxy })
   ctx.on('dispose', () => browser.dispose())
+
+  // 鉴定：没装 database 时 store 会自动用内存，不阻塞插件启动。
+  const store = new AccountStore(ctx, { logger, cacheHours: config.cacheHours })
+  const verifier = new Verifier({
+    logger,
+    store,
+    baseUrl: config.aiBaseUrl,
+    apiKey: config.aiApiKey,
+    model: config.aiModel,
+    timeoutMs: config.aiTimeoutMs,
+    cooldownSec: config.checkCooldownSec,
+    dailyLimit: config.checkDailyLimit,
+    cacheHours: config.cacheHours
+  })
+  ctx.inject(['database'], (ctx) => defineModel(ctx))
+  ctx.on('ready', () => {
+    if (!store.persistent) logger.warn('没有 database 服务：鉴定结果只存在内存里，重启就没了。装上 database-sqlite / database-mysql 可持久化。')
+  })
 
   // 冷却：同一个人 30 秒内别刷 —— 反查引擎有免费额度，刷爆了大家都不能用。
   const lastUse = new Map<string, number>()
@@ -131,6 +177,10 @@ export function apply(ctx: Context, config: Config) {
         logger.warn('找鸡失败：%s', (error as Error)?.stack ?? error)
         return h.text(`找鸡失败：${(error as Error)?.message ?? error}`)
       }
+      const twitter = accounts.find((account) => account.platform === 'twitter')
+      if (config.checkHint && twitter) {
+        text += `\n\n· 想看这个号可信度：发「鉴定 ${twitter.handle}」`
+      }
       // 有账号、又有「已找到」图：图+文一条发出去（一条比两条稳）。
       const found = accounts.length ? loadFoundImage() : null
       if (found) {
@@ -147,8 +197,71 @@ export function apply(ctx: Context, config: Config) {
       return h.text(text)
     })
 
+  ctx.command('鉴定 <target:text>', '查 X(Twitter) 账号可信度')
+    .usage('发「鉴定 @用户名」，或者「鉴定 https://x.com/用户名」。AI 会去 X 上搜账号资料和他人评价，给出 0–200 的可信度、标签和风险。')
+    .example('鉴定 @alice')
+    .action(async ({ session }, target) => {
+      if (!session) return
+      if (!config.aiApiKey) return '还没配置 xAI API Key：在插件配置里填上 aiApiKey 才能鉴定。'
+      const handle = String(target ?? '').trim()
+      if (!handle) return '用法：鉴定 @用户名，或者 鉴定 https://x.com/用户名'
+      let normalized: string
+      try {
+        normalized = verifier.normalize(handle)
+      } catch (error) {
+        return (error as Error).message
+      }
+      await session.send(`收到，正在鉴定 @${normalized}（要搜一会儿，别急）`)
+      try {
+        const outcome = await verifier.check(normalized, `${keyOf(session)}|check`)
+        return h.text(formatReport(outcome.row, {
+          cached: outcome.cached,
+          stale: outcome.stale,
+          cacheHours: config.cacheHours
+        }))
+      } catch (error) {
+        if (!(error instanceof UserError)) logger.warn('鉴定失败：%s', (error as Error)?.stack ?? error)
+        return h.text(`鉴定失败：${(error as Error)?.message ?? error}`)
+      }
+    })
+
+  ctx.command('烧鸡榜 [category:text]', '看鉴定过的账号排行榜')
+    .usage('发「烧鸡榜」看全部分类，或者「烧鸡榜 风俗业者」只看一个。分类：' + RANK_CATEGORIES.map((category) => category.title).join(' / '))
+    .example('烧鸡榜 评分最高')
+    .action(async ({ session }, category) => {
+      if (!session) return
+      const picked = resolveCategory(category)
+      if (String(category ?? '').trim() && !picked) {
+        return `没有这个榜。可用：${RANK_CATEGORIES.map((item) => item.title).join(' / ')}`
+      }
+      let rows
+      try {
+        rows = await store.list()
+      } catch (error) {
+        return h.text(`读榜单失败：${(error as Error)?.message ?? error}`)
+      }
+      if (!rows.length) {
+        return config.aiApiKey
+          ? '库里还没有鉴定记录。先发「鉴定 @用户名」查几个，榜单就有内容了。'
+          : '库里还没有鉴定记录，而且还没配置 xAI API Key，没法鉴定。'
+      }
+      const keys = picked ? [picked.key] : RANK_CATEGORIES.map((item) => item.key)
+      const groups = buildRank(rows, keys, config.rankSize).filter((group) => group.rows.length)
+      if (!groups.length) {
+        return picked ? `「${picked.title}」还没有符合条件的记录。` : '库里还没有能上榜的记录。'
+      }
+      try {
+        await session.send(buildRankForward(groups))
+        return
+      } catch (error) {
+        logger.warn('合并转发失败，回退纯文字：%s', (error as Error)?.message ?? error)
+        return formatRankText(groups)
+      }
+    })
+
   ctx.inject(['chatluna'], (ctx) => {
     if (!config.registerTool) return
     registerFindBitchTool(ctx, { logger, findChicken, lastUse, gap, keyOf })
+    if (config.aiApiKey) registerCheckBitchTool(ctx, { logger, verifier })
   })
 }

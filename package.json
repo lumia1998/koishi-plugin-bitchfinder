@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-bitchfinder",
-  "description": "鱼鱼找鸡：给一张图，反查这人是哪个 coser、账号在哪（谷歌 Lens / SauceNAO / trace.moe 多引擎，零 token）",
-  "version": "2.1.4",
+  "description": "根据图片和用户名找鸡和鉴别鸡：图片反查 coser/博主社媒账号，用户名鉴定 X 账号可信度与烧鸡榜",
+  "version": "2.2.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -13,7 +13,7 @@
   },
   "author": "lumia1998 (Koishi port)",
   "contributors": [
-    "小鲸鱼 (original 鱼鱼找鸡, MIT)"
+    "鱼鱼找鸡 v1.0.0 (original find algorithm, MIT)"
   ],
   "repository": {
     "type": "git",
@@ -33,13 +33,16 @@
     "saucenao",
     "tracemoe",
     "puppeteer",
-    "chatluna"
+    "chatluna",
+    "xai",
+    "twitter",
+    "trust-check"
   ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc -w",
     "clean": "rimraf lib",
-    "test": "npm run build && node --test test/differential.test.mjs",
+    "test": "npm run build && node --test test/differential.test.mjs test/check.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -66,14 +69,15 @@
   },
   "koishi": {
     "description": {
-      "zh": "鱼鱼找鸡：引用一张图发「找鸡」，多引擎反查 coser 的社媒账号（谷歌 Lens / SauceNAO / trace.moe）。可选注册 ChatLuna 工具 findbitch。"
+      "zh": "根据图片和用户名找鸡和鉴别鸡：引用图片发「找鸡」，多引擎反查 coser/博主的社媒账号（谷歌 Lens / SauceNAO / trace.moe）；配 xAI Key 后可用「鉴定 @用户名」查 X 账号可信度与风险、「烧鸡榜」看排行。可选注册 ChatLuna 工具 findbitch / checkbitch。"
     },
     "service": {
       "required": [
         "puppeteer"
       ],
       "optional": [
-        "chatluna"
+        "chatluna",
+        "database"
       ],
       "implements": []
     }

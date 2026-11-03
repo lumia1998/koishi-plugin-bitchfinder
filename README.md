@@ -1,10 +1,11 @@
-# koishi-plugin-bitchfinder（鱼鱼找鸡）
+# koishi-plugin-bitchfinder
 
-给一张图，反查这人是哪个 coser、账号在哪。
+根据图片和用户名找鸡、鉴别鸡：给一张图反查这人是哪个 coser、账号在哪；给一个 X 用户名，鉴定账号真实度和风险。
 
-- 多引擎：**谷歌 Lens**（最准，能抓到推特主页）、SauceNAO（动漫/同人）、trace.moe（动漫截屏）、IQDB、百度识图。
-- 零 token：不调用任何大模型，**不花 API 钱**。
-- 忠实移植自 **鱼鱼找鸡 v1.0.0**（小鲸鱼，MIT），核心算法、阈值、文案与原版一致。
+- **找鸡**：多引擎——**谷歌 Lens**（最准，能抓到推特主页）、SauceNAO（动漫/同人）、trace.moe（动漫截屏）、IQDB、百度识图。零 token，不调用任何大模型，**不花 API 钱**。
+- **鉴定**：发 `鉴定 @用户名`，xAI 用 `x_search` 去 X 上搜账号资料和他人评价，给出 0–200 可信度、标签、差评/风险（盗图、皮下男、骗钱跑路、冒充）。这部分**要你自己的 xAI Key，按量收费**。
+- **烧鸡榜**：发 `烧鸡榜`，把鉴定过的账号按「最新爆料 / 最新检索 / 评分最高 / 风俗业者 / 门槛妹 / AV女优 / 福利博主 / JP 日文区 / 诈骗预警」分类，每类前 5 个，用合并转发显示头像、用户名和 X 地址。
+- 找鸡部分参考 **鱼鱼找鸡 v1.0.0** 的仓库，鉴定与烧鸡榜参考 [FLJopen](https://github.com/iam567/FLJopen) 的仓库。
 
 ## 依赖
 
@@ -12,19 +13,49 @@
 |---|---|
 | `koishi-plugin-puppeteer`（必装） | Lens / 百度识图要在真浏览器里跑，用的是它的浏览器实例。**需要在它的 `args` 里加 `--disable-blink-features=AutomationControlled`**（实测不加时 Lens 3/3 被谷歌验证码拦，加了 3/3 通过；对其他用 puppeteer 的插件无副作用） |
 | 能访问谷歌 | 只用 SauceNAO / trace.moe / IQDB 的话国内直连即可；要用 Lens，要么系统能连谷歌，要么在插件配置里填 `proxy`，要么给 puppeteer 插件的启动参数加 `--proxy-server=…` |
-| `koishi-plugin-chatluna`（可选） | 装了会自动注册工具 `findbitch`，让模型按需反查 |
+| `koishi-plugin-chatluna`（可选） | 装了会自动注册工具 `findbitch`（反查图）和 `checkbitch`（鉴定账号） |
+| `database` 服务（可选，但推荐） | 鉴定结果存 Koishi 数据库（表 `bitchfinder_account`）。没装也能用，只是只存内存、重启就丢。SQLite / MySQL / PostgreSQL 都行 |
+| xAI API Key（可选） | 用在 console.x.ai 生成的 Key。不填就不能「鉴定」，找鸡不受影响 |
 
 ## 用法
 
-**引用一张图**，发 `找鸡`（或直接带图发 `找鸡`，也可以 `找鸡 <图片网址>`）。它先回「收到，开始找鸡」，再回结果：
+**找鸡**：引用一张图，发 `找鸡`（或直接带图发 `找鸡`，也可以 `找鸡 <图片网址>`）。它先回「收到，开始找鸡」，再回结果：
 
 ```
-🎯 鱼鱼找鸡结果
+🎯 找鸡结果
 
 🌐 平台：Twitter
 👤 名字：阿薰kaOri
 🆔 账号：@izayoill · https://x.com/izayoill
 ```
+
+**鉴定**：`鉴定 @izayoill` 或 `鉴定 https://x.com/izayoill`。结果长这样：
+
+```
+🔍 鉴定结果 · @izayoill
+👤 阿薰kaOri
+📊 可信度 86/200（🟡 一般）
+🏷️ 风俗业者 · 巨乳 · 东京
+📈 粉丝 12.3k · 发帖 3.4k · 号龄 2.1 年 · 蓝V
+👍 好评 3 条：有人推荐、好评
+👎 差评 1 条：盗图
+📝 主要发……
+🔗 https://x.com/izayoill
+```
+
+**烧鸡榜**：`烧鸡榜` 看全部有数据的分类，`烧鸡榜 风俗业者` 只看一个。每个分类一个合并转发节点，节点里 5 个人，带头像、名字、@用户名、分数和 X 地址。分类和别名：
+
+| 分类 | 怎么上榜 |
+|---|---|
+| 最新爆料 | 有差评或风险标签，按差评数排 |
+| 最新检索 | 最近鉴定的，按时间排 |
+| 评分最高 | 可信度从高到低 |
+| 风俗业者 | 标签含「风俗业者」 |
+| 门槛妹 | 标签含「有门槛费」 |
+| AV女优 | 标签含「AV女优」 |
+| 福利博主 | 标签含「福利博主」 |
+| JP 日文区 | 语言是日文，或活跃城市在日本 |
+| 诈骗预警 | 风险标签含「骗钱跑路」或「冒充他人」 |
 
 ## 配置
 
@@ -37,8 +68,17 @@
 | `strictConsensus` | `true` | 开 = 名字对不上的别人的号不报（少报不错报）；关 = 全都报出来自己挑 |
 | `proxy` | 空 | 只让本插件的浏览器页面走这个代理（例如 `http://127.0.0.1:7890`）。留空 = 跟随 puppeteer 插件（它会自动使用 Koishi 全局代理） |
 | `foundImage` | 空 | 查到账号时顺带发的图（本机文件路径，相对路径按 Koishi 根目录算）。留空 = 不发图 |
-| `cooldownSec` | `30` | 同一个人在同一个会话里的冷却秒数（反查引擎有免费额度，刷爆了大家都不能用）。`0` = 不限 |
-| `registerTool` | `true` | 装了 ChatLuna 时注册工具 `findbitch`，让模型按需反查 |
+| `cooldownSec` | `30` | 同一个人的找鸡冷却秒数（反查引擎有免费额度，刷爆了大家都不能用）。`0` = 不限 |
+| `registerTool` | `true` | 装了 ChatLuna 时注册工具 `findbitch` / `checkbitch` |
+| `aiBaseUrl` | `https://api.x.ai/v1` | xAI API 地址。**只支持 xAI**：鉴定依赖它的 `x_search`，换别家模型不成立 |
+| `aiApiKey` | 空 | xAI API Key（secret）。不填则「鉴定」不可用 |
+| `aiModel` | `grok-4.3` | 模型名。报 404 就换账号当前可用的型号（如 `grok-4.5`） |
+| `aiTimeoutMs` | `60000` | 单次 xAI 请求超时。鉴定会并行跑两次搜索 |
+| `cacheHours` | `72` | 鉴定结果复用时长。期间再查直接读库，不重复扣 xAI 费用；`0` = 每次都重查 |
+| `checkCooldownSec` | `30` | 鉴定冷却秒数（同一个人）。只对真正调用 AI 的请求生效，读缓存不受限 |
+| `checkDailyLimit` | `10` | 每个人每天最多鉴定几次，防止被人刷你的 xAI 余额；`0` = 不限 |
+| `rankSize` | `5` | 烧鸡榜每个分类显示几个人 |
+| `checkHint` | `true` | 找鸡查到 X 账号时，末尾加一句「发鉴定 @用户名 查可信度」 |
 
 ## 它是怎么认的（也是「为什么有时候查不到」的原因）
 
@@ -64,34 +104,27 @@
 **findbitch 工具报「禁止访问内网/本机地址」**
 内网/127.x/10.x URL 是有意拦的（防注入探测内网）。让模型传**本机文件路径**（如 `/tmp/x.png`）或 `base64://` 数据，不要传内网 URL。
 
+**鉴定报 401 / 402 / 429 / 404**
+- 401/403：Key 不对或没有 xAI API 权限。
+- 402/429：余额不足或被限流。
+- 404：`aiModel` 型号不可用，去 [xAI 文档](https://docs.x.ai/docs/models) 换一个当前可用的。
+
+**鉴定一次要花多少钱**
+xAI 按量计费，除了 token，`x_search` 还会按抓取条数另算（搜索帖子和用户资料分别计价）。一次鉴定会并行跑两次搜索（资料 + 第三方评价），所以别拿它当免费接口刷——本插件默认 30 秒冷却、每人每天 10 次，就是防这个。具体单价看 [xAI 定价](https://docs.x.ai/developers/pricing)。
+
+**为什么只能接 xAI**
+鉴定不是普通聊天：它要让模型实时去 X 搜「别人怎么评价这个号」。xAI 的 `x_search` 工具直接搜 X，换成 OpenAI / DeepSeek 等模型就只能靠训练数据瞎编。所以要换也只能换 xAI 的模型名，不能换供应商。
+
+**没装 database 会怎样**
+鉴定结果只放进程内存，Koishi 重启就没了，「烧鸡榜」也会空。插件会打一条 warn 提醒。装 `koishi-plugin-database-sqlite`（或 MySQL/PostgreSQL）即可，表会自动建。
+
+**鉴定会把用户名发给谁**
+发给 xAI（用你的 Key），由它去搜 X 上的公开资料。只发用户名，不发聊天记录、不存 Key。介意就别用鉴定，找鸡不受影响。
+
 **图片会不会被上传到网上**
 会——反查必须把图发给引擎（谷歌 Lens / SauceNAO / trace.moe / IQDB / 百度…）。上传目标写死在代码里的 `UPLOAD_HOSTS` 白名单里，不读配置，防止被配置改去奇怪的域名。不想上传就别用。
 
 ## 许可证
 
-- 本插件（Koishi 移植层）AGPL-3.0，见 `LICENSE`。
-- 核心逻辑移植自 **鱼鱼找鸡 v1.0.0**（作者：小鲸鱼），按 MIT 授权使用：
-
-```
-MIT License
-
-Copyright (c) 2026 小鲸鱼
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
+- 本插件：AGPL-3.0，见 `LICENSE`。
+- 找鸡部分参考 **鱼鱼找鸡 v1.0.0**（MIT）的仓库；鉴定与烧鸡榜部分参考 [FLJopen](https://github.com/iam567/FLJopen) 的仓库。
