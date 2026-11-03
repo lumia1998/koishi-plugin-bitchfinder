@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-bitchfinder",
   "description": "根据图片和用户名找鸡和鉴别鸡：图片反查 coser/博主社媒账号，用户名鉴定 X 账号可信度与烧鸡榜",
-  "version": "2.2.0",
+  "version": "2.2.2",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -69,7 +69,7 @@
   },
   "koishi": {
     "description": {
-      "zh": "根据图片和用户名找鸡和鉴别鸡：引用图片发「找鸡」，多引擎反查 coser/博主的社媒账号（谷歌 Lens / SauceNAO / trace.moe）；配 xAI Key 后可用「鉴定 @用户名」查 X 账号可信度与风险、「烧鸡榜」看排行。可选注册 ChatLuna 工具 findbitch / checkbitch。"
+      "zh": "根据图片和用户名找鸡和鉴别鸡：引用图片发「找鸡」，多引擎反查 coser/博主的社媒账号（谷歌 Lens / SauceNAO / trace.moe）；配 xAI Key 后可用「鉴定 @用户名」查 X 账号可信度与风险；「烧鸡榜」直接读 flj.info 的公开排行榜。可选注册 ChatLuna 工具 findbitch / checkbitch。"
     },
     "service": {
       "required": [

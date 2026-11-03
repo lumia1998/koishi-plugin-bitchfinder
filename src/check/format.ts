@@ -2,11 +2,11 @@
 import { h } from 'koishi'
 import { positiveLabel, resultTags, riskLabel, scoreTier } from './score'
 import type { RankCategory } from './rank'
-import type { AccountRow } from './types'
+import type { AccountRow, RankEntry } from './types'
 
 export interface RankGroup {
   category: RankCategory
-  rows: AccountRow[]
+  rows: RankEntry[]
 }
 
 export const X_PROFILE = 'https://x.com/'

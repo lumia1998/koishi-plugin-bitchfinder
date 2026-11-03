@@ -1,9 +1,10 @@
 // 鉴定 / 榜单里不依赖网络的部分：用户名解析、JSON 抠取、评分、分类、报告格式。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { checkAccount, extractJson, normalizeHandle } from '../lib/check/ai.js'
+import { checkAccount, extractJson, normalizeHandle, pickModel, resolveModel } from '../lib/check/ai.js'
 import { buildRankForward, formatRankText, formatReport } from '../lib/check/format.js'
-import { pickTop, resolveCategory } from '../lib/check/rank.js'
+import { pickTop, RANK_CATEGORIES, resolveCategory } from '../lib/check/rank.js'
+import { RankFetcher } from '../lib/check/remote.js'
 import { calcScore, scoreTier } from '../lib/check/score.js'
 import { Verifier } from '../lib/check/service.js'
 import { AccountStore } from '../lib/check/store.js'
@@ -258,6 +259,120 @@ test('Verifier 遇到 401 时给出明确错误', async () => {
       cooldownSec: 0, dailyLimit: 0, cacheHours: 72
     })
     await assert.rejects(() => verifier.check('@alice'), /401/)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('pickModel 跳过图像/视频/构建模型，选最新创建的正式版', () => {
+  const picked = pickModel([
+    { id: 'grok-imagine-image-2.0', created: 200 },
+    { id: 'grok-imagine-video-1.5', created: 190 },
+    { id: 'grok-build-0.1', created: 180 },
+    { id: 'grok-4.20-multi-agent-0309', created: 170 },
+    { id: 'grok-4.5', created: 100 },
+    { id: 'grok-4.7', created: 120 },
+    { id: 'grok-4.8-beta', created: 130 }
+  ])
+  assert.equal(picked, 'grok-4.7')
+  // 只有 beta 时才退而求其次
+  assert.equal(pickModel([{ id: 'grok-4.8-beta', created: 1 }]), 'grok-4.8-beta')
+  assert.equal(pickModel([]), null)
+})
+
+test('resolveModel 在 aiModel 留空时自动取模型列表并缓存', async () => {
+  const original = globalThis.fetch
+  const urls = []
+  globalThis.fetch = async (url) => {
+    urls.push(String(url))
+    return new Response(JSON.stringify({
+      data: [
+        { id: 'grok-4.3', created: 1 },
+        { id: 'grok-4.7', created: 3 },
+        { id: 'grok-imagine-image', created: 9 }
+      ]
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+  try {
+    const options = { baseUrl: 'https://auto.example/v1', apiKey: 'test', model: '', timeoutMs: 5000 }
+    assert.equal(await resolveModel(options), 'grok-4.7')
+    assert.equal(await resolveModel(options), 'grok-4.7')
+    assert.equal(urls.length, 1, '模型列表命中缓存')
+    assert.equal(urls[0], 'https://auto.example/v1/models')
+
+    // 配置了 aiModel 就不请求模型列表
+    assert.equal(await resolveModel({ ...options, baseUrl: 'https://fixed.example/v1', model: 'grok-4.6' }), 'grok-4.6')
+    assert.equal(urls.length, 1)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('resolveModel 获取模型列表失败时给出可读错误', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = async () => new Response('nope', { status: 500 })
+  try {
+    await assert.rejects(
+      () => resolveModel({ baseUrl: 'https://fail.example/v1', apiKey: 'test', model: '', timeoutMs: 5000 }),
+      /500/
+    )
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('每个烧鸡榜分类都有对应的 flj.info category', () => {
+  const mapping = Object.fromEntries(RANK_CATEGORIES.map((category) => [category.key, category.api]))
+  assert.deepEqual(mapping, {
+    latest: 'comments',
+    recent: 'latest',
+    top: 'score',
+    fushi: 'fushi',
+    threshold: 'threshold',
+    av: 'av',
+    welfare: 'welfare',
+    japan: 'ja',
+    scam: 'risky'
+  })
+})
+
+test('RankFetcher 从 flj.info 拉榜、映射字段并缓存', async () => {
+  const original = globalThis.fetch
+  const urls = []
+  globalThis.fetch = async (url) => {
+    urls.push(String(url))
+    return new Response(JSON.stringify({
+      items: [
+        { twitter_username: 'Alice_01', display_name: ' Tester ', avatar_url: '/avatar/a.jpg', score: 97 },
+        { twitter_username: 'bad name', display_name: 'x', avatar_url: null, score: 10 },
+        { twitter_username: 'bob', display_name: '', avatar_url: 'https://img/b.jpg', score: 999 }
+      ]
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+  try {
+    const fetcher = new RankFetcher('https://flj.info')
+    const rows = await fetcher.fetch(resolveCategory('最新爆料'), 2)
+    assert.equal(urls[0], 'https://flj.info/api/rankings?category=comments&page=1')
+    assert.deepEqual(rows.map((item) => item.handle), ['alice_01', 'bob'])
+    assert.equal(rows[0].displayName, 'Tester')
+    assert.equal(rows[0].avatarUrl, 'https://flj.info/avatar/a.jpg')
+    assert.equal(rows[0].score, 97)
+    assert.equal(rows[1].displayName, null)
+    assert.equal(rows[1].score, 200)
+
+    await fetcher.fetch(resolveCategory('最新爆料'), 2)
+    assert.equal(urls.length, 1, '同一分类命中缓存')
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('RankFetcher 接口失败时抛出可读错误', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = async () => new Response('nope', { status: 500 })
+  try {
+    const fetcher = new RankFetcher('https://flj.info/api/rankings')
+    await assert.rejects(() => fetcher.fetch(resolveCategory('评分最高'), 5), /500/)
   } finally {
     globalThis.fetch = original
   }

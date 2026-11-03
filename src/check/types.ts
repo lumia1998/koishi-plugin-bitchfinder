@@ -33,6 +33,14 @@ export interface CheckResult {
   isVerified: boolean | null
 }
 
+/** 榜单条目：本机记录和 flj.info 接口共用这几个字段。 */
+export interface RankEntry {
+  handle: string
+  displayName: string | null
+  score: number
+  avatarUrl: string | null
+}
+
 /** 数据库里的一行。 */
 export interface AccountRow extends CheckResult {
   id: number

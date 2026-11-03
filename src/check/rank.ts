@@ -4,6 +4,8 @@ import type { AccountRow } from './types'
 export interface RankCategory {
   key: string
   title: string
+  /** flj.info 排行榜接口的 category 参数。 */
+  api: string
   /** 用户输入这些词也能命中（大小写不敏感）。 */
   aliases: string[]
   filter(row: AccountRow): boolean
@@ -29,6 +31,7 @@ export const RANK_CATEGORIES: RankCategory[] = [
   {
     key: 'latest',
     title: '最新爆料',
+    api: 'comments',
     aliases: ['最新爆料', '爆料', '最新', 'latest'],
     filter: (row) => row.complaints > 0 || row.riskTags.length > 0,
     compare: byComplaint
@@ -36,6 +39,7 @@ export const RANK_CATEGORIES: RankCategory[] = [
   {
     key: 'recent',
     title: '最新检索',
+    api: 'latest',
     aliases: ['最新检索', '最新檢索', '最近检索', '最近', 'recent'],
     filter: () => true,
     compare: byTime
@@ -43,6 +47,7 @@ export const RANK_CATEGORIES: RankCategory[] = [
   {
     key: 'top',
     title: '评分最高',
+    api: 'score',
     aliases: ['评分最高', '評分最高', '最高分', '评分', 'top', 'score'],
     filter: () => true,
     compare: byScore
@@ -50,6 +55,7 @@ export const RANK_CATEGORIES: RankCategory[] = [
   {
     key: 'fushi',
     title: '风俗业者',
+    api: 'fushi',
     aliases: ['风俗业者', '風俗業者', '风俗', '風俗', 'fushi'],
     filter: hasTag('风俗业者'),
     compare: byScore
@@ -57,6 +63,7 @@ export const RANK_CATEGORIES: RankCategory[] = [
   {
     key: 'threshold',
     title: '门槛妹',
+    api: 'threshold',
     aliases: ['门槛妹', '門檻妹', '门槛', '門檻', '有门槛费', 'threshold'],
     filter: hasTag('有门槛费'),
     compare: byScore
@@ -64,6 +71,7 @@ export const RANK_CATEGORIES: RankCategory[] = [
   {
     key: 'av',
     title: 'AV女优',
+    api: 'av',
     aliases: ['AV女优', 'AV女優', 'av', '女优', '女優'],
     filter: hasTag('AV女优'),
     compare: byScore
@@ -71,6 +79,7 @@ export const RANK_CATEGORIES: RankCategory[] = [
   {
     key: 'welfare',
     title: '福利博主',
+    api: 'welfare',
     aliases: ['福利博主', '福利', '图包博主', '圖包博主', 'welfare'],
     filter: hasTag('福利博主'),
     compare: byScore
@@ -78,6 +87,7 @@ export const RANK_CATEGORIES: RankCategory[] = [
   {
     key: 'japan',
     title: 'JP 日文区',
+    api: 'ja',
     aliases: ['jp', 'japan', '日文区', '日文區', '日本', '日区', '日區'],
     filter: isJapanese,
     compare: byScore
@@ -85,6 +95,7 @@ export const RANK_CATEGORIES: RankCategory[] = [
   {
     key: 'scam',
     title: '诈骗预警',
+    api: 'risky',
     aliases: ['诈骗预警', '詐騙預警', '诈骗', '詐騙', '差评', '避雷', 'scam', 'warning'],
     filter: (row) => row.riskTags.includes('scam') || row.riskTags.includes('impersonation'),
     compare: byComplaint

@@ -19,6 +19,93 @@ export class AiError extends Error {
   }
 }
 
+/** 自动选模型的结果缓存 10 分钟：模型列表不会每分钟变。 */
+const MODEL_CACHE_TTL = 10 * 60_000
+const modelCache = new Map<string, { at: number; promise: Promise<string> }>()
+
+function apiBase(value: string): string {
+  const base = String(value || '').trim().replace(/\/+$/, '') || 'https://api.x.ai/v1'
+  return base.replace(/\/responses$/, '')
+}
+
+/**
+ * 配置里填了 aiModel 就照用；留空则从 /v1/models 自动选。
+ * 选最新创建的、能跑 x_search 的文本模型，跳过图像/视频/构建/实验模型。
+ */
+export async function resolveModel(options: AiOptions): Promise<string> {
+  const configured = String(options.model ?? '').trim()
+  if (configured) return configured
+
+  const base = apiBase(options.baseUrl)
+  const cached = modelCache.get(base)
+  if (cached && Date.now() - cached.at < MODEL_CACHE_TTL) return cached.promise
+
+  const promise = fetchModelList(base, options.apiKey)
+  modelCache.set(base, { at: Date.now(), promise })
+  try {
+    return await promise
+  } catch (error) {
+    // 失败不缓存，下次鉴定重试
+    modelCache.delete(base)
+    throw error
+  }
+}
+
+async function fetchModelList(base: string, apiKey: string): Promise<string> {
+  if (!apiKey) throw new AiError('还没配置 xAI API Key，先在插件配置里填上。', 'no_key')
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 15_000)
+  let res: Response
+  try {
+    res = await fetch(`${base}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+      signal: controller.signal
+    })
+  } catch (error) {
+    if (controller.signal.aborted) throw new AiError('获取 xAI 模型列表超时：可以在配置里手动填 aiModel。', 'timeout')
+    throw new AiError(`连不上 xAI 模型列表：${(error as Error)?.message ?? error}`, 'network')
+  } finally {
+    clearTimeout(timer)
+  }
+
+  if (res.status === 401 || res.status === 403) throw new AiError('xAI API Key 无效或没有权限（401/403）。', 'auth')
+  if (!res.ok) throw new AiError(`获取 xAI 模型列表失败（${res.status}）：可以在配置里手动填 aiModel。`, 'http')
+
+  let data: any
+  try {
+    data = await res.json()
+  } catch {
+    throw new AiError('xAI 模型列表返回的不是 JSON：可以在配置里手动填 aiModel。', 'http')
+  }
+  const picked = pickModel(data?.data)
+  if (!picked) throw new AiError('xAI 没有返回可用的文本模型：可以在配置里手动填 aiModel。', 'empty')
+  return picked
+}
+
+/** 从 /v1/models 的 data 里挑最新的可用文本模型。 */
+export function pickModel(items: unknown): string | null {
+  if (!Array.isArray(items)) return null
+  const all = items
+    .map((item: any) => ({
+      id: typeof item?.id === 'string' ? item.id.trim() : '',
+      created: Number(item?.created) || 0
+    }))
+    .filter((item) => item.id && isTextModel(item.id))
+  if (!all.length) return null
+  // 有正式版就不选 beta/experimental；只有 beta 时才退而求其次
+  const stable = all.filter((item) => !/beta|experimental/i.test(item.id))
+  const pool = stable.length ? stable : all
+  pool.sort((a, b) => b.created - a.created || a.id.localeCompare(b.id))
+  return pool[0].id
+}
+
+function isTextModel(id: string): boolean {
+  if (!/^grok-/i.test(id)) return false
+  // 图像/视频/构建/多智能体模型不一定支持 x_search
+  return !/imagine|video|image|build|multi-agent/i.test(id)
+}
+
 const RISK_TYPES = ['stolen_photo', 'fake_gender', 'scam', 'impersonation']
 const POSITIVE_TYPES = ['recommended', 'verified_real', 'praised', 'trusted']
 const CONTENT_TAGS = ['巨乳', '童颜', '御姐', '萝莉', '美腿', '黑丝', '不露脸', '多人', 'SM', '调教', '女同', '4P', '熟女', '美臀', '纯爱', '情侣', 'NTR', '小狗']
@@ -78,11 +165,13 @@ export function extractJson<T = Record<string, unknown>>(text: string): T | null
 
 async function xaiSearch(input: string, maxOutputTokens: number, options: AiOptions): Promise<string> {
   if (!options.apiKey) throw new AiError('还没配置 xAI API Key，先在插件配置里填上。', 'no_key')
-  const base = String(options.baseUrl || '').trim().replace(/\/+$/, '') || 'https://api.x.ai/v1'
-  const url = base.endsWith('/responses') ? base : `${base}/responses`
+  const url = `${apiBase(options.baseUrl)}/responses`
+  // aiModel 留空时自动选；两个并行请求会共用同一次 /v1/models 查询。
+  const model = await resolveModel(options)
 
+  // x_search 要真去 X 搜资料和第三方评价，完整鉴定实测 60–90 秒；默认给足 180 秒。
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), Math.max(5000, options.timeoutMs || 60000))
+  const timer = setTimeout(() => controller.abort(), Math.max(5000, options.timeoutMs || 180000))
   let res: Response
   try {
     res = await fetch(url, {
@@ -92,7 +181,7 @@ async function xaiSearch(input: string, maxOutputTokens: number, options: AiOpti
         Authorization: `Bearer ${options.apiKey}`
       },
       body: JSON.stringify({
-        model: options.model,
+        model,
         tools: [{ type: 'x_search' }],
         input,
         max_output_tokens: maxOutputTokens
@@ -100,7 +189,7 @@ async function xaiSearch(input: string, maxOutputTokens: number, options: AiOpti
       signal: controller.signal
     })
   } catch (error) {
-    if (controller.signal.aborted) throw new AiError('xAI 请求超时，稍后再试。', 'timeout')
+    if (controller.signal.aborted) throw new AiError('xAI 请求超时。x_search 完整搜索通常要 60–90 秒，把配置里的 aiTimeoutMs 调到 180000（或更大）再试。', 'timeout')
     throw new AiError(`连不上 xAI：${(error as Error)?.message ?? error}`, 'network')
   } finally {
     clearTimeout(timer)

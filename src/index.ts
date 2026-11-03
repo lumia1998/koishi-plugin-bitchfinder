@@ -8,7 +8,9 @@ import { extractAccounts, formatReply } from './accounts'
 import type { Account } from './accounts'
 import { FishBrowser } from './browser'
 import { buildRankForward, formatRankText, formatReport } from './check/format'
+import type { RankGroup } from './check/format'
 import { buildRank, RANK_CATEGORIES, resolveCategory } from './check/rank'
+import { RankFetcher } from './check/remote'
 import { UserError, Verifier } from './check/service'
 import { AccountStore, defineModel } from './check/store'
 import { registerCheckBitchTool } from './check/tool'
@@ -29,7 +31,7 @@ export const usage = `根据图片和用户名找鸡和鉴别鸡：给一张图�
 用法：
 · 引用一张图发「找鸡」（或带图发）
 · 发「鉴定 @用户名」查 X 账号可信度（需要 xAI API Key）
-· 发「烧鸡榜」看鉴定过的账号排行
+· 发「烧鸡榜」看 flj.info 排行榜（连不上时用本机记录）
 
 反查必须把图发给引擎（谷歌 / SauceNAO / trace.moe …），不想上传就别用。
 鉴定会把用户名发给 xAI，由它去 X 上搜公开资料和他人评价。`
@@ -52,6 +54,7 @@ export interface Config {
   checkCooldownSec: number
   checkDailyLimit: number
   rankSize: number
+  rankApiBase: string
   checkHint: boolean
 }
 
@@ -73,12 +76,13 @@ export const Config: Schema<Config> = Schema.object({
   registerTool: Schema.boolean().default(true).description('装了 ChatLuna 时注册工具 findbitch，让模型按需反查。'),
   aiBaseUrl: Schema.string().default('https://api.x.ai/v1').description('xAI API 地址，默认官方地址。只支持 xAI：鉴定靠 x_search 去 X 上搜实时资料，换别家模型不成立。'),
   aiApiKey: Schema.string().role('secret').default('').description('xAI API Key（console.x.ai 生成）。不填则「鉴定」不可用。按量收费，每次鉴定跑两次 x_search。'),
-  aiModel: Schema.string().default('grok-4.3').description('模型名。官方文档里的当前型号是 grok-4.3 / grok-4.5 等；如果报 404，换成账号可用的型号。'),
-  aiTimeoutMs: Schema.natural().role('ms').default(60000).description('单次 xAI 请求超时。鉴定要跑两次并行搜索，给足时间。'),
+  aiModel: Schema.string().default('').description('模型名。留空 = 自动从 /v1/models 选最新可用的 grok 文本模型（推荐）；也可以手动填 grok-4.7 固定型号。'),
+  aiTimeoutMs: Schema.natural().role('ms').default(180000).description('单次 xAI 请求超时。x_search 要真去 X 搜资料和评价，完整鉴定实测 60–90 秒，默认 180 秒留足余量。'),
   cacheHours: Schema.natural().default(72).description('鉴定结果的复用时长（小时）。期间同一个人再查直接读库，不重复扣 xAI 费用。0 = 每次都重新查。'),
   checkCooldownSec: Schema.natural().default(30).description('鉴定冷却秒数（同一个人）。只对真正调用 AI 的请求生效，读缓存不受限。'),
   checkDailyLimit: Schema.natural().default(10).description('每个人每天最多鉴定几次（防止被人拿去刷你的 xAI 余额）。0 = 不限。'),
   rankSize: Schema.natural().min(1).default(5).description('烧鸡榜每个分类显示几个人。'),
+  rankApiBase: Schema.string().default('https://flj.info/api/rankings').description('烧鸡榜的数据接口（flj.info 的公开排行榜）。留空 = 只用本机鉴定记录；接口连不上时会自动回退到本机记录。'),
   checkHint: Schema.boolean().default(true).description('找鸡查到 X 账号时，在结果末尾加一句「发鉴定 @用户名 查可信度」的提示。'),
 })
 
@@ -89,6 +93,7 @@ export function apply(ctx: Context, config: Config) {
 
   // 鉴定：没装 database 时 store 会自动用内存，不阻塞插件启动。
   const store = new AccountStore(ctx, { logger, cacheHours: config.cacheHours })
+  const rankFetcher = new RankFetcher(config.rankApiBase)
   const verifier = new Verifier({
     logger,
     store,
@@ -225,8 +230,8 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
-  ctx.command('烧鸡榜 [category:text]', '看鉴定过的账号排行榜')
-    .usage('发「烧鸡榜」看全部分类，或者「烧鸡榜 风俗业者」只看一个。分类：' + RANK_CATEGORIES.map((category) => category.title).join(' / '))
+  ctx.command('烧鸡榜 [category:text]', '看烧鸡榜（flj.info，连不上时用本机记录）')
+    .usage('发「烧鸡榜」看全部分类，或者「烧鸡榜 风俗业者」只看一个。数据来自 flj.info 的公开排行榜；接口连不上时自动用本机鉴定记录。分类：' + RANK_CATEGORIES.map((category) => category.title).join(' / '))
     .example('烧鸡榜 评分最高')
     .action(async ({ session }, category) => {
       if (!session) return
@@ -234,22 +239,47 @@ export function apply(ctx: Context, config: Config) {
       if (String(category ?? '').trim() && !picked) {
         return `没有这个榜。可用：${RANK_CATEGORIES.map((item) => item.title).join(' / ')}`
       }
-      let rows
-      try {
-        rows = await store.list()
-      } catch (error) {
-        return h.text(`读榜单失败：${(error as Error)?.message ?? error}`)
+      const categories = picked ? [picked] : RANK_CATEGORIES
+
+      // 优先读 flj.info 的公开榜；网站本来就有数据，不用先把账号鉴定一遍。
+      const groups: RankGroup[] = []
+      let remote = false
+      if (rankFetcher.enabled) {
+        const results = await Promise.allSettled(categories.map((item) => rankFetcher.fetch(item, config.rankSize)))
+        results.forEach((result, index) => {
+          if (result.status === 'fulfilled') {
+            remote = true
+            if (result.value.length) groups.push({ category: categories[index], rows: result.value })
+          } else {
+            logger.warn('排行榜接口失败：%s', (result.reason as Error)?.message ?? result.reason)
+          }
+        })
       }
-      if (!rows.length) {
-        return config.aiApiKey
-          ? '库里还没有鉴定记录。先发「鉴定 @用户名」查几个，榜单就有内容了。'
-          : '库里还没有鉴定记录，而且还没配置 xAI API Key，没法鉴定。'
+
+      if (!remote) {
+        // 接口不可用：退回本机鉴定记录
+        let rows
+        try {
+          rows = await store.list()
+        } catch (error) {
+          return h.text(`读榜单失败：${(error as Error)?.message ?? error}`)
+        }
+        const local = buildRank(rows, categories.map((item) => item.key), config.rankSize)
+          .filter((group) => group.rows.length)
+        if (!local.length) {
+          if (!rankFetcher.enabled) {
+            return '没有配置排行榜接口（rankApiBase），本机也没有鉴定记录。先发「鉴定 @用户名」查几个，或者在配置里填上 rankApiBase。'
+          }
+          return `flj.info 排行榜暂时连不上，本机也没有${picked ? `「${picked.title}」的` : ''}鉴定记录。先发「鉴定 @用户名」查几个，或者稍后再试。`
+        }
+        await session.send('⚠️ flj.info 排行榜接口暂时连不上，下面用本机鉴定记录兜底。')
+        groups.push(...local)
       }
-      const keys = picked ? [picked.key] : RANK_CATEGORIES.map((item) => item.key)
-      const groups = buildRank(rows, keys, config.rankSize).filter((group) => group.rows.length)
+
       if (!groups.length) {
-        return picked ? `「${picked.title}」还没有符合条件的记录。` : '库里还没有能上榜的记录。'
+        return picked ? `「${picked.title}」暂时没有数据。` : 'flj.info 排行榜暂时没有数据。'
       }
+
       try {
         await session.send(buildRankForward(groups))
         return
